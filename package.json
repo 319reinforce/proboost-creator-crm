@@ -1,0 +1,32 @@
+{
+  "name": "proboost-creator-crm",
+  "version": "0.1.0",
+  "description": "Creator CRM for ProBoost invite, reply, reminder, and conversion operations.",
+  "main": "src/cli/index.js",
+  "scripts": {
+    "init": "node src/cli/index.js init",
+    "import": "node src/cli/index.js import",
+    "list:unused": "node src/cli/index.js list-unused",
+    "render": "node src/cli/index.js render-template",
+    "report": "node src/cli/index.js report",
+    "doctor": "node src/cli/index.js doctor",
+    "login": "node src/cli/index.js login",
+    "search": "node src/cli/index.js search",
+    "remind": "node src/cli/index.js remind",
+    "ready-followup": "node src/cli/index.js ready-followup",
+    "web": "node src/web/server.js",
+    "legacy:ready-login": "node src/cli/index.js legacy ready-login",
+    "legacy:unused": "node src/cli/index.js legacy unused",
+    "legacy:replied": "node src/cli/index.js legacy replied"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.9.0",
+    "commander": "^12.1.0",
+    "express": "^5.2.1",
+    "multer": "^2.1.1",
+    "playwright": "^1.40.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

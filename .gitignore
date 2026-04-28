@@ -1,0 +1,12 @@
+node_modules/
+.DS_Store
+data/
+reports/
+data/*.sqlite
+data/*.sqlite-*
+reports/**/*.json
+reports/**/*.csv
+.proboost-auth/
+.proboost-reply-auth/
+.proboost-creator-crm-auth/
+.legacy-auth/

@@ -1,4 +1,5 @@
 const path = require('path');
+const fs = require('fs');
 const { resolveAuthConfig } = require('./auth-config');
 
 function boolEnv(name, fallback = false) {
@@ -8,7 +9,19 @@ function boolEnv(name, fallback = false) {
 }
 
 const rootDir = path.resolve(__dirname, '..');
+const sharedAuthRoots = [
+  '/Users/depp/proboost-ready-reminder/.proboost-reply-auth',
+  '/Users/depp/send-mail/.proboost-auth',
+];
 const auth = resolveAuthConfig({ baseDir: rootDir, appName: 'proboost-creator-crm' });
+const sharedAuthRoot = sharedAuthRoots.find(item => fs.existsSync(item));
+if (!process.env.PROBOOST_AUTH_ROOT && sharedAuthRoot) {
+  auth.authRoot = sharedAuthRoot;
+  auth.userRoot = path.join(sharedAuthRoot, auth.userId);
+  auth.profilePath = path.join(auth.userRoot, 'edge-profile');
+  auth.statePath = path.join(auth.userRoot, 'storage-state.json');
+  auth.cookiePath = path.join(auth.userRoot, 'cookies.json');
+}
 
 module.exports = {
   rootDir,

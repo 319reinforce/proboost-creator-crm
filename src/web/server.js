@@ -3,6 +3,16 @@ const path = require('path');
 const express = require('express');
 const multer = require('multer');
 const config = require('../config');
+const { page } = require('./views/layout');
+const {
+  openDb,
+  initDb,
+  upsertTaskRun,
+  updateTaskRun,
+  listTaskRuns,
+} = require('../db');
+const { loginInteractively } = require('../automation/session');
+const { runReadyFollowupBatch } = require('../automation/reminderRunner');
 const { listManifestPaths, readManifest } = require('../sendMailBridge/manifest');
 const {
   uploadsDir,
@@ -20,6 +30,8 @@ function ensureDir(dirPath) {
 ensureDir(uploadsDir);
 ensureDir(batchesDir);
 ensureDir(runsDir);
+const readyFollowupRunsDir = path.join(config.reportDir, 'ready-followups');
+ensureDir(readyFollowupRunsDir);
 
 const upload = multer({
   dest: uploadsDir,
@@ -32,8 +44,32 @@ const upload = multer({
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
+app.use('/assets', express.static(path.join(__dirname, 'public')));
 
+const webDb = initDb(openDb());
+webDb.prepare(`
+  UPDATE task_runs
+  SET status = 'failed',
+      error = COALESCE(NULLIF(error, ''), 'Server restarted before this task finished. Re-run from the UI if needed.'),
+      finished_at = COALESCE(finished_at, CURRENT_TIMESTAMP),
+      updated_at = CURRENT_TIMESTAMP
+  WHERE status = 'running'
+`).run();
 const activeJobs = new Map();
+const eventClients = new Set();
+
+app.get('/events', (req, res) => {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    Connection: 'keep-alive',
+  });
+  res.write('\n');
+  eventClients.add(res);
+  req.on('close', () => {
+    eventClients.delete(res);
+  });
+});
 
 function newJobId() {
   return `${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
@@ -50,20 +86,53 @@ function startJob({ type, manifestPath, batchNumber, templateName, task }) {
     startedAt: new Date().toISOString(),
     finishedAt: '',
     error: '',
+    result: null,
   };
   activeJobs.set(job.id, job);
+  upsertTaskRun(webDb, {
+    ...job,
+    payload: { manifestPath, batchNumber, templateName },
+  });
+  broadcastJob(job);
   Promise.resolve()
     .then(task)
-    .then(() => {
+    .then(result => {
       job.status = 'finished';
       job.finishedAt = new Date().toISOString();
+      job.result = result || null;
+      updateTaskRun(webDb, job.id, {
+        status: job.status,
+        finishedAt: job.finishedAt,
+        result: job.result,
+        error: '',
+      });
+      broadcastJob(job);
     })
     .catch(error => {
       job.status = 'failed';
       job.finishedAt = new Date().toISOString();
       job.error = String(error.stack || error.message || error);
+      updateTaskRun(webDb, job.id, {
+        status: job.status,
+        finishedAt: job.finishedAt,
+        error: job.error,
+      });
+      broadcastJob(job);
     });
   return job;
+}
+
+function broadcastJob(job) {
+  const payload = JSON.stringify({
+    id: job.id,
+    type: job.type,
+    status: job.status,
+    startedAt: job.startedAt,
+    finishedAt: job.finishedAt,
+  });
+  for (const res of eventClients) {
+    res.write(`event: job\ndata: ${payload}\n\n`);
+  }
 }
 
 function escapeHtml(value) {
@@ -96,6 +165,45 @@ function readTail(filePath, maxLines = 18) {
   if (!filePath || !fs.existsSync(filePath)) return '';
   const lines = fs.readFileSync(filePath, 'utf8').trimEnd().split(/\r?\n/);
   return lines.slice(-maxLines).join('\n');
+}
+
+function writeJson(filePath, payload) {
+  ensureDir(path.dirname(filePath));
+  fs.writeFileSync(filePath, JSON.stringify(payload, null, 2));
+}
+
+function readJson(filePath) {
+  try {
+    return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function listReadyFollowupReports() {
+  if (!fs.existsSync(readyFollowupRunsDir)) return [];
+  return fs.readdirSync(readyFollowupRunsDir)
+    .filter(name => name.endsWith('.json'))
+    .map(name => {
+      const filePath = path.join(readyFollowupRunsDir, name);
+      return { filePath, payload: readJson(filePath), mtimeMs: fs.statSync(filePath).mtimeMs };
+    })
+    .filter(item => item.payload)
+    .sort((a, b) => b.mtimeMs - a.mtimeMs);
+}
+
+function recentTaskRuns(type, limit = 8) {
+  const persisted = listTaskRuns(webDb, { type, limit });
+  const running = [...activeJobs.values()].filter(job => !type || job.type === type);
+  const byId = new Map();
+  for (const job of [...running, ...persisted]) byId.set(job.id, job);
+  return [...byId.values()]
+    .sort((a, b) => String(b.startedAt).localeCompare(String(a.startedAt)))
+    .slice(0, limit);
+}
+
+function hasRunningJob(type) {
+  return [...activeJobs.values()].some(job => job.type === type && job.status === 'running');
 }
 
 function summarizeLog(filePath) {
@@ -157,100 +265,22 @@ function clampPage(value, totalPages) {
   return Math.min(page, Math.max(totalPages, 1));
 }
 
-function renderPagination({ pageNumber, totalPages, totalItems }) {
+function renderPagination({ pageNumber, totalPages, totalItems, basePath = '/send' }) {
   if (totalItems <= 2) return '';
   const pages = [];
   for (let page = 1; page <= totalPages; page += 1) {
-    pages.push(`<a class="el-pager ${page === pageNumber ? 'is-active' : ''}" href="/?page=${page}">${page}</a>`);
+    pages.push(`<a class="el-pager ${page === pageNumber ? 'is-active' : ''}" href="${basePath}?page=${page}">${page}</a>`);
   }
   const prevClass = pageNumber <= 1 ? 'is-disabled' : '';
   const nextClass = pageNumber >= totalPages ? 'is-disabled' : '';
-  const prevHref = pageNumber <= 1 ? `/?page=${pageNumber}` : `/?page=${pageNumber - 1}`;
-  const nextHref = pageNumber >= totalPages ? `/?page=${pageNumber}` : `/?page=${pageNumber + 1}`;
+  const prevHref = pageNumber <= 1 ? `${basePath}?page=${pageNumber}` : `${basePath}?page=${pageNumber - 1}`;
+  const nextHref = pageNumber >= totalPages ? `${basePath}?page=${pageNumber}` : `${basePath}?page=${pageNumber + 1}`;
   return `<nav class="el-pagination" aria-label="工单分页">
     <span class="el-pagination__total">共 ${totalItems} 个工单</span>
     <a class="el-page-btn ${prevClass}" href="${prevHref}">上一页</a>
     ${pages.join('')}
     <a class="el-page-btn ${nextClass}" href="${nextHref}">下一页</a>
   </nav>`;
-}
-
-function page(title, body) {
-  return `<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <meta http-equiv="refresh" content="20" />
-  <title>${escapeHtml(title)}</title>
-  <style>
-    :root { color-scheme: light; --el-color-primary:#409eff; --el-color-primary-dark-2:#337ecc; --el-color-danger:#f56c6c; --el-color-success:#67c23a; --el-color-warning:#e6a23c; --el-color-info:#909399; --el-text-color-primary:#303133; --el-text-color-regular:#606266; --el-text-color-secondary:#909399; --el-border-color:#dcdfe6; --el-border-color-light:#e4e7ed; --el-fill-color-blank:#fff; --el-fill-color-light:#f5f7fa; --el-bg-color-page:#f2f3f5; --el-border-radius-base:4px; }
-    * { box-sizing: border-box; }
-    body { margin:0; font-family: Helvetica Neue, Helvetica, PingFang SC, Hiragino Sans GB, Microsoft YaHei, Arial, sans-serif; color:var(--el-text-color-primary); background:var(--el-bg-color-page); font-size:14px; }
-    header { height:56px; display:flex; align-items:center; justify-content:space-between; padding:0 24px; background:var(--el-fill-color-blank); border-bottom:1px solid var(--el-border-color-light); }
-    h1 { margin:0; font-size:18px; font-weight:600; }
-    main { max-width:1160px; margin:0 auto; padding:20px 24px 32px; }
-    section, .el-card { background:var(--el-fill-color-blank); border:1px solid var(--el-border-color-light); border-radius:var(--el-border-radius-base); box-shadow:0 1px 2px rgba(0,0,0,.04); margin-bottom:16px; }
-    section { padding:18px; }
-    h2 { margin:0 0 16px; font-size:15px; font-weight:600; }
-    label { display:block; font-size:13px; color:var(--el-text-color-regular); margin:8px 0 6px; }
-    input, select { width:100%; border:1px solid var(--el-border-color); border-radius:var(--el-border-radius-base); padding:8px 11px; font-size:14px; line-height:20px; background:#fff; color:var(--el-text-color-primary); outline:none; transition:border-color .2s; }
-    input:focus, select:focus { border-color:var(--el-color-primary); }
-    input[type=file] { padding:8px; }
-    button, .button { display:inline-flex; align-items:center; justify-content:center; min-height:32px; padding:8px 15px; border:1px solid var(--el-color-primary); border-radius:var(--el-border-radius-base); background:var(--el-color-primary); color:#fff; font-weight:500; text-decoration:none; cursor:pointer; line-height:1; }
-    button.secondary, .button.secondary { background:#fff; color:var(--el-color-primary); }
-    button.danger { background:var(--el-color-danger); border-color:var(--el-color-danger); }
-    table { width:100%; border-collapse:collapse; font-size:13px; }
-    th, td { text-align:left; border-bottom:1px solid var(--el-border-color-light); padding:10px 8px; vertical-align:top; }
-    th { color:var(--el-text-color-regular); font-weight:600; background:var(--el-fill-color-light); }
-    .grid { display:grid; grid-template-columns: repeat(3, 1fr); gap:16px; }
-    .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
-    .muted { color:var(--el-text-color-secondary); }
-    .work-order { padding:0; overflow:hidden; }
-    .work-head { display:grid; grid-template-columns: minmax(0, 1fr) 260px; gap:16px; padding:18px 20px; background:#fff; border-bottom:1px solid var(--el-border-color-light); }
-    .work-title { margin:0; font-size:15px; font-weight:600; overflow-wrap:anywhere; }
-    .path { margin-top:6px; color:var(--el-text-color-secondary); font-size:12px; overflow-wrap:anywhere; }
-    .stats { display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; }
-    .metric, .el-tag { display:inline-flex; align-items:center; height:28px; padding:0 9px; border:1px solid #d9ecff; border-radius:4px; background:#ecf5ff; color:#409eff; font-size:12px; }
-    .metric strong { font-size:13px; color:#337ecc; margin-right:4px; }
-    .work-actions { min-width:260px; }
-    .work-body { padding:16px 20px 18px; background:#fff; }
-    details { border-top:1px solid var(--el-border-color-light); margin-top:12px; padding-top:12px; }
-    summary { cursor:pointer; color:var(--el-color-primary); font-weight:500; list-style:none; }
-    summary::before { content:"▶"; margin-right:6px; font-size:10px; }
-    details[open] summary::before { content:"▼"; }
-    .batch-box { max-height:300px; overflow:auto; border:1px solid var(--el-border-color-light); border-radius:4px; margin-top:10px; }
-    .log-tail { margin-top:10px; background:#111827; color:#e5e7eb; border-radius:4px; padding:12px; max-height:180px; overflow:auto; font-size:12px; white-space:pre-wrap; }
-    .status { display:inline-flex; align-items:center; height:24px; padding:0 8px; border-radius:4px; background:#ecf5ff; color:#409eff; font-size:12px; }
-    .status.sent { background:#f0f9eb; color:var(--el-color-success); }
-    .status.failed { background:#fdf6ec; color:var(--el-color-warning); }
-    .status.hard-failed { background:#fef0f0; color:var(--el-color-danger); }
-    .status.prepared { background:#fdf6ec; color:var(--el-color-warning); }
-    .el-pagination { display:flex; align-items:center; justify-content:flex-end; gap:8px; padding:4px 0 20px; color:var(--el-text-color-regular); }
-    .el-pagination__total { margin-right:8px; color:var(--el-text-color-regular); }
-    .el-page-btn, .el-pager { min-width:32px; height:32px; display:inline-flex; align-items:center; justify-content:center; padding:0 8px; border-radius:4px; color:var(--el-text-color-primary); text-decoration:none; background:transparent; font-weight:500; }
-    .el-pager.is-active { color:var(--el-color-primary); }
-    .el-page-btn.is-disabled { color:#c0c4cc; pointer-events:none; }
-    pre { white-space:pre-wrap; background:#0f172a; color:#e5e7eb; padding:14px; border-radius:8px; overflow:auto; max-height:520px; }
-    @media (max-width: 760px) {
-      header { padding:0 16px; }
-      main { padding:14px; }
-      .grid, .work-head { grid-template-columns:1fr; }
-      .work-actions { min-width:0; }
-    }
-  </style>
-</head>
-<body>
-  <header>
-    <h1>ProBoost Creator CRM</h1>
-    <nav class="row">
-      <a class="button secondary" href="/">审核台</a>
-      <a class="button secondary" href="/logs">日志</a>
-    </nav>
-  </header>
-  <main>${body}</main>
-</body>
-</html>`;
 }
 
 function renderWorkOrders(pageNumber = 1) {
@@ -269,7 +299,7 @@ function renderWorkOrders(pageNumber = 1) {
   const totalPages = Math.ceil(manifests.length / pageSize);
   const currentPage = clampPage(pageNumber, totalPages);
   const visibleManifests = manifests.slice((currentPage - 1) * pageSize, currentPage * pageSize);
-  const pagination = renderPagination({ pageNumber: currentPage, totalPages, totalItems: manifests.length });
+  const pagination = renderPagination({ pageNumber: currentPage, totalPages, totalItems: manifests.length, basePath: '/send' });
 
   return `${pagination}${visibleManifests.map(({ manifestPath, manifest }) => {
     const campaignName = manifest.campaignName || path.basename(path.dirname(manifestPath));
@@ -278,7 +308,7 @@ function renderWorkOrders(pageNumber = 1) {
     const fixedTitle = fixMojibake(campaignName);
     const sourceFile = manifest.inputFile || manifest.originalUpload || '';
     const unverified = summary.confirmedButUnverified;
-    const active = [...activeJobs.values()].filter(job => job.manifestPath === manifestPath && job.status === 'running');
+    const active = recentTaskRuns(null, 50).filter(job => job.manifestPath === manifestPath && job.status === 'running');
     const rows = (manifest.batches || []).map(batch => `
       <tr>
         <td>${escapeHtml(batch.batchNumber)}</td>
@@ -338,9 +368,127 @@ function renderWorkOrders(pageNumber = 1) {
   }).join('')}${pagination}`;
 }
 
-app.get('/', (req, res) => {
-  const pageNumber = Number.parseInt(req.query.page || '1', 10);
-  res.send(page('ProBoost Creator CRM', `
+function actionLabel(action) {
+  if (action === 'send_whatsapp_followup') return '有联系方式，发 WhatsApp 跟进模板';
+  if (action === 'send_register_followup') return '无联系方式，发注册提醒模板';
+  if (action === 'skip_registered') return '已注册，跳过';
+  if (action === 'ignore') return '未识别 ready，忽略';
+  return action || '-';
+}
+
+function renderInboxClassification() {
+  const jobs = recentTaskRuns('ready-followup', 5);
+
+  const reports = listReadyFollowupReports().slice(0, 5);
+  const latestJob = jobs[0];
+  const latestReport = reports[0]?.payload;
+  const latest = latestJob?.status === 'running' ? latestJob : latestReport;
+  const result = latest?.result || latest;
+  const rows = (result?.results || []).slice(0, 40).map(item => {
+    const classification = item.classification || {};
+    const statusClass = item.status === 'failed' ? 'hard-failed'
+      : item.status === 'dry-run' ? 'prepared'
+        : item.status === 'ignore' || item.status === 'skip_registered' ? ''
+          : item.status;
+    return `<tr>
+      <td>${escapeHtml(item.sender || '-')}</td>
+      <td>${escapeHtml(item.subject || '-')}</td>
+      <td><span class="status ${escapeHtml(statusClass)}">${escapeHtml(classification.intent || item.status || '-')}</span></td>
+      <td>${escapeHtml(actionLabel(classification.recommendedAction))}</td>
+      <td>${escapeHtml((classification.phoneNumbers || []).join(', ') || '-')}</td>
+      <td>${escapeHtml((classification.inviteCodes || []).join(', ') || '-')}</td>
+      <td>${escapeHtml(item.template || '-')}</td>
+      <td>${escapeHtml(item.stage || '-')}</td>
+      <td>${escapeHtml(item.threadChars || 0)}</td>
+      <td>${escapeHtml(item.error || '-')}</td>
+    </tr>`;
+  }).join('');
+
+  const summary = result ? `<div class="stats">
+    <span class="metric"><strong data-followup-metric="scannedRows">${result.scannedRows || 0}</strong> 列表行</span>
+    <span class="metric"><strong data-followup-metric="processed">${result.processed || 0}</strong> 已检查</span>
+    <span class="metric"><strong data-followup-metric="opened">${result.opened || 0}</strong> 已点开</span>
+    <span class="metric"><strong data-followup-metric="threadRead">${result.threadRead || 0}</strong> 已读正文</span>
+    <span class="metric"><strong data-followup-metric="openFailed">${result.openFailed || 0}</strong> 点开失败</span>
+    <span class="metric"><strong data-followup-metric="readyCount">${result.readyCount || 0}</strong> ready</span>
+    <span class="metric"><strong data-followup-metric="whatsappFollowups">${result.whatsappFollowups || 0}</strong> 联系方式跟进</span>
+    <span class="metric"><strong data-followup-metric="registerFollowups">${result.registerFollowups || 0}</strong> 注册提醒</span>
+    <span class="metric"><strong data-followup-metric="skippedRegistered">${result.skippedRegistered || 0}</strong> 已注册跳过</span>
+  </div>` : '';
+
+  const jobRows = [
+    ...jobs,
+    ...reports.map(item => item.payload),
+  ].slice(0, 8).map(job => `<tr>
+    <td>${escapeHtml(job.startedAt)}</td>
+    <td><span class="status ${job.status === 'failed' ? 'hard-failed' : job.status === 'finished' ? 'sent' : 'prepared'}">${escapeHtml(job.status)}</span></td>
+    <td>${escapeHtml(job.templateName || '-')}</td>
+    <td>${escapeHtml(job.finishedAt || '-')}</td>
+    <td>${job.error ? `<details><summary>错误</summary><pre>${escapeHtml(job.error)}</pre></details>` : escapeHtml(job.result?.runId || job.runId || '-')}</td>
+  </tr>`).join('');
+
+  return `<section id="inbox-classifier">
+    <h2>收件箱分类与二次触达</h2>
+    <form method="post" action="/inbox/ready-followup">
+      <div class="grid">
+        <div>
+          <label>扫描页数</label>
+          <input name="maxPages" type="number" min="1" value="1" />
+        </div>
+        <div>
+          <label>检查封数上限</label>
+          <input name="limit" type="number" min="0" value="10" />
+        </div>
+        <div>
+          <label>Ready 关键词</label>
+          <input name="readyKeywords" value="ready" />
+        </div>
+        <div>
+          <label>有联系方式模板</label>
+          <input name="templateWhatsapp" value="感谢发送联系方式" />
+        </div>
+        <div>
+          <label>无联系方式模板</label>
+          <input name="templateRegister" value="督促产品使用" />
+        </div>
+        <div>
+          <label>已注册名单补充</label>
+          <input name="registeredNames" placeholder="逗号分隔 handle 或名字" />
+        </div>
+      </div>
+      <p class="muted">默认只 dry-run：打开已回复收件箱、逐封读取正文、判断 ready/联系方式/邀请码，并记录推荐动作。勾选真实发送才会回复邮件。</p>
+      <p class="muted">当前登录态：${escapeHtml(config.auth.profilePath)}。如果需要登录，先打开登录窗口，完成登录后窗口会自动关闭并保存登录态。</p>
+      <label class="row" style="display:inline-flex; margin:0 12px 0 0">
+        <input name="send" type="checkbox" value="1" style="width:auto" />
+        真实发送二次触达
+      </label>
+      <button type="submit">开始检查收件箱</button>
+    </form>
+    <form method="post" action="/auth/login" style="margin-top:10px">
+      <button class="secondary" type="submit">登录并保存 ProBoost 状态</button>
+    </form>
+    ${latest ? `<details open style="margin-top:16px">
+      <summary>最近一次分类结果</summary>
+      <div id="followup-summary">${summary}</div>
+      <p id="followup-running" class="muted" ${latest.status === 'running' ? '' : 'hidden'}>后台正在检查收件箱，等待实时结果。</p>
+      <pre id="followup-error" ${latest.error ? '' : 'hidden'}>${escapeHtml(latest.error || '')}</pre>
+      ${rows ? `<div class="batch-box"><table>
+        <thead><tr><th>发件人</th><th>主题</th><th>意图</th><th>推荐动作</th><th>联系方式</th><th>邀请码</th><th>模板</th><th>阶段</th><th>正文字符</th><th>错误</th></tr></thead>
+        <tbody id="followup-result-rows">${rows}</tbody>
+      </table></div>` : '<p class="muted">还没有分类结果。</p>'}
+    </details>` : '<p class="muted">还没有运行过收件箱分类。</p>'}
+    ${jobRows ? `<details>
+      <summary>最近二次触达任务</summary>
+      <div class="batch-box"><table>
+        <thead><tr><th>开始时间</th><th>状态</th><th>模板</th><th>结束时间</th><th>运行ID/错误</th></tr></thead>
+        <tbody id="followup-task-rows">${jobRows}</tbody>
+      </table></div>
+    </details>` : ''}
+  </section>`;
+}
+
+function renderSendPage(pageNumber) {
+  return `
     <section>
       <h2>上传并拆分 xlsx</h2>
       <datalist id="template-options">
@@ -367,7 +515,132 @@ app.get('/', (req, res) => {
       </form>
     </section>
     ${renderWorkOrders(pageNumber)}
-  `));
+  `;
+}
+
+function renderDashboard() {
+  const manifests = listManifestPaths(batchesDir)
+    .map(manifestPath => readManifest(manifestPath))
+    .filter(Boolean);
+  const sendSummary = manifests.reduce((acc, manifest) => {
+    const summary = summarizeManifest(manifest);
+    acc.workOrders += 1;
+    acc.batches += summary.total;
+    acc.rows += summary.totalRows;
+    acc.pending += summary.pending;
+    acc.sent += summary.sent;
+    acc.unverified += summary.confirmedButUnverified;
+    return acc;
+  }, { workOrders: 0, batches: 0, rows: 0, pending: 0, sent: 0, unverified: 0 });
+  const reports = listReadyFollowupReports();
+  const latest = reports[0]?.payload;
+  return `<section>
+    <h2>数据看板</h2>
+    <div class="stats">
+      <span class="metric"><strong>${sendSummary.workOrders}</strong> 发信工单</span>
+      <span class="metric"><strong>${sendSummary.batches}</strong> 批次</span>
+      <span class="metric"><strong>${sendSummary.rows}</strong> 达人行数</span>
+      <span class="metric"><strong>${sendSummary.pending}</strong> 待发送</span>
+      <span class="metric"><strong>${sendSummary.unverified}</strong> 已确认待复核</span>
+      <span class="metric"><strong>${reports.length}</strong> 二次触达运行</span>
+    </div>
+    ${latest ? `<details open style="margin-top:16px">
+      <summary>最近二次触达</summary>
+      <div class="stats">
+        <span class="metric"><strong>${escapeHtml(latest.status)}</strong> 状态</span>
+        <span class="metric"><strong>${latest.result?.processed || 0}</strong> 已检查</span>
+        <span class="metric"><strong>${latest.result?.readyCount || 0}</strong> ready</span>
+        <span class="metric"><strong>${latest.result?.whatsappFollowups || 0}</strong> 联系方式跟进</span>
+        <span class="metric"><strong>${latest.result?.registerFollowups || 0}</strong> 注册提醒</span>
+      </div>
+      ${latest.error ? `<pre>${escapeHtml(latest.error)}</pre>` : ''}
+    </details>` : '<p class="muted">还没有二次触达运行记录。</p>'}
+  </section>`;
+}
+
+function followupSummaryPayload() {
+  const jobs = recentTaskRuns('ready-followup', 5);
+  const reports = listReadyFollowupReports().slice(0, 5);
+  const latestJob = jobs[0];
+  const latestReport = reports[0]?.payload;
+  const latest = latestJob?.status === 'running' ? latestJob : latestReport;
+  const result = latest?.result || null;
+  return {
+    latest: latest ? {
+      id: latest.id || '',
+      status: latest.status || '',
+      startedAt: latest.startedAt || '',
+      finishedAt: latest.finishedAt || '',
+      error: latest.error || '',
+      templateName: latest.templateName || '',
+    } : null,
+    result: result ? {
+      scannedRows: result.scannedRows || 0,
+      processed: result.processed || 0,
+      opened: result.opened || 0,
+      threadRead: result.threadRead || 0,
+      openFailed: result.openFailed || 0,
+      readyCount: result.readyCount || 0,
+      whatsappFollowups: result.whatsappFollowups || 0,
+      registerFollowups: result.registerFollowups || 0,
+      skippedRegistered: result.skippedRegistered || 0,
+      runId: result.runId || '',
+    } : {
+      scannedRows: 0,
+      processed: 0,
+      opened: 0,
+      threadRead: 0,
+      openFailed: 0,
+      readyCount: 0,
+      whatsappFollowups: 0,
+      registerFollowups: 0,
+      skippedRegistered: 0,
+      runId: '',
+    },
+    rows: (result?.results || []).slice(0, 40).map(item => ({
+      sender: item.sender || '',
+      subject: item.subject || '',
+      status: item.status || '',
+      stage: item.stage || '',
+      template: item.template || '',
+      threadChars: item.threadChars || 0,
+      error: item.error || '',
+      classification: item.classification || {},
+    })),
+    tasks: [
+      ...jobs,
+      ...reports.map(item => item.payload),
+    ].slice(0, 8).map(job => ({
+      id: job.id || '',
+      status: job.status || '',
+      startedAt: job.startedAt || '',
+      finishedAt: job.finishedAt || '',
+      templateName: job.templateName || '',
+      runId: job.result?.runId || job.runId || '',
+      error: job.error || '',
+    })),
+  };
+}
+
+app.get('/', (_req, res) => {
+  res.redirect(302, '/send');
+});
+
+app.get('/api/followup-summary', (_req, res) => {
+  res.json(followupSummaryPayload());
+});
+
+app.get('/send', (req, res) => {
+  const pageNumber = Number.parseInt(req.query.page || '1', 10);
+  res.send(page('发信 - ProBoost Creator CRM', renderSendPage(pageNumber), 'send'));
+});
+
+app.get('/followup', (_req, res) => {
+  res.send(page('二次触达 - ProBoost Creator CRM', renderInboxClassification(), 'followup'));
+});
+
+app.get('/dashboard', (_req, res) => {
+  res.send(page('数据看板 - ProBoost Creator CRM', renderDashboard(), 'dashboard'));
 });
 
 app.post('/upload', upload.array('files', 20), async (req, res, next) => {
@@ -392,9 +665,119 @@ app.post('/upload', upload.array('files', 20), async (req, res, next) => {
           totalRows: item.manifest.totalRows,
           manifestPath: item.manifestPath,
         })), null, 2)}</pre>
-        <a class="button" href="/">返回审核台</a>
+        <a class="button" href="/send">返回发信</a>
       </section>
     `));
+  } catch (error) {
+    next(error);
+  }
+});
+
+function readyFollowupOptionsFromBody(body) {
+  return {
+    maxPages: body.maxPages || '1',
+    limit: body.limit || '10',
+    readyKeywords: body.readyKeywords || 'ready',
+    registeredNames: body.registeredNames || '',
+    templateWhatsapp: body.templateWhatsapp || '感谢发送联系方式',
+    templateRegister: body.templateRegister || '督促产品使用',
+    send: body.send === '1' || body.send === 'on',
+    keepOpen: false,
+    headless: false,
+    signupLink: body.signupLink || config.defaultSignupLink,
+    expiresIn: body.expiresIn || config.defaultExpiresIn,
+    bonusAmount: body.bonusAmount || config.defaultBonusAmount,
+  };
+}
+
+app.post('/inbox/ready-followup', async (req, res, next) => {
+  try {
+    const options = readyFollowupOptionsFromBody(req.body);
+    const reportOptions = { ...options, send: Boolean(options.send) };
+    const reportId = `ready-followup-${new Date().toISOString().replace(/[:.]/g, '-')}`;
+    const reportPath = path.join(readyFollowupRunsDir, `${reportId}.json`);
+    if (hasRunningJob('auth-login')) {
+      writeJson(reportPath, {
+        id: reportId,
+        status: 'failed',
+        startedAt: new Date().toISOString(),
+        finishedAt: new Date().toISOString(),
+        templateName: `${options.templateWhatsapp} / ${options.templateRegister}`,
+        options: reportOptions,
+        result: null,
+        error: 'ProBoost 登录窗口仍在运行。请先在打开的窗口完成登录，等窗口自动关闭并保存登录态后，再开始检查收件箱。',
+      });
+      res.redirect(303, '/followup#inbox-classifier');
+      return;
+    }
+    startJob({
+      type: 'ready-followup',
+      templateName: `${options.templateWhatsapp} / ${options.templateRegister}`,
+      task: async () => {
+        const startedAt = new Date().toISOString();
+        const writeReport = (payload) => writeJson(reportPath, {
+          id: reportId,
+          status: payload.status,
+          startedAt,
+          finishedAt: payload.finishedAt || '',
+          templateName: `${options.templateWhatsapp} / ${options.templateRegister}`,
+          options: reportOptions,
+          result: payload.result || null,
+          error: payload.error || '',
+        });
+        writeReport({ status: 'running' });
+        const db = openDb();
+        let lastProgress = null;
+        try {
+          initDb(db);
+          const result = await runReadyFollowupBatch(db, {
+            ...options,
+            onProgress: progress => {
+              lastProgress = progress;
+              writeReport({
+                status: 'running',
+                result: progress,
+              });
+            },
+          });
+          writeReport({
+            status: 'finished',
+            finishedAt: new Date().toISOString(),
+            result,
+            error: '',
+          });
+          return result;
+        } catch (error) {
+          writeReport({
+            status: 'failed',
+            finishedAt: new Date().toISOString(),
+            result: lastProgress,
+            error: String(error.stack || error.message || error),
+          });
+          throw error;
+        } finally {
+          db.close();
+        }
+      },
+    });
+    res.redirect(303, '/followup#inbox-classifier');
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/auth/login', async (_req, res, next) => {
+  try {
+    if (hasRunningJob('auth-login')) {
+      res.redirect(303, '/followup#inbox-classifier');
+      return;
+    }
+    startJob({
+      type: 'auth-login',
+      templateName: 'ProBoost login',
+      task: () => loginInteractively({ keepOpen: false, headless: false }),
+    });
+    res.redirect(303, '/followup#inbox-classifier');
   } catch (error) {
     next(error);
   }
@@ -420,7 +803,7 @@ app.post('/batch/prepare', async (req, res, next) => {
       templateName: options.templateName,
       task: () => runBatch(req.body.manifestPath, req.body.batchNumber, options),
     });
-    res.redirect(303, '/');
+    res.redirect(303, '/send');
   } catch (error) {
     next(error);
   }
@@ -436,7 +819,7 @@ app.post('/batch/send', async (req, res, next) => {
       templateName: options.templateName,
       task: () => runBatch(req.body.manifestPath, req.body.batchNumber, options),
     });
-    res.redirect(303, '/');
+    res.redirect(303, '/send');
   } catch (error) {
     next(error);
   }
@@ -451,7 +834,7 @@ app.post('/batch/send-pending', async (req, res, next) => {
       templateName: options.templateName,
       task: () => runPending(req.body.manifestPath, options),
     });
-    res.redirect(303, '/');
+    res.redirect(303, '/send');
   } catch (error) {
     next(error);
   }
@@ -462,13 +845,13 @@ app.get('/logs', (_req, res) => {
     ? fs.readdirSync(runsDir).filter(name => name.endsWith('.log')).sort().reverse()
     : [];
   const list = logs.slice(0, 80).map(name => `<tr><td>${escapeHtml(fixMojibake(name))}</td><td><a class="button secondary" href="/logs/${encodeURIComponent(name)}">查看</a></td></tr>`).join('');
-  res.send(page('日志', `<section><h2>运行日志</h2><table><tbody>${list}</tbody></table></section>`));
+  res.send(page('日志', `<section><h2>运行日志</h2><table><tbody>${list}</tbody></table></section>`, ''));
 });
 
 app.get('/logs/:name', (req, res) => {
   const logPath = path.join(runsDir, req.params.name);
   const text = fs.existsSync(logPath) ? fs.readFileSync(logPath, 'utf8') : 'log not found';
-  res.send(page('日志详情', `<section><h2>${escapeHtml(fixMojibake(req.params.name))}</h2><pre>${escapeHtml(text)}</pre></section>`));
+  res.send(page('日志详情', `<section><h2>${escapeHtml(fixMojibake(req.params.name))}</h2><pre>${escapeHtml(text)}</pre></section>`, ''));
 });
 
 app.use((error, _req, res, _next) => {
@@ -476,12 +859,12 @@ app.use((error, _req, res, _next) => {
     <section>
       <h2>执行出错</h2>
       <pre>${String(error.stack || error.message).replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]))}</pre>
-      <a class="button" href="/">返回审核台</a>
+      <a class="button" href="/send">返回发信</a>
     </section>
   `));
 });
 
-const port = Number(process.env.PORT || 8787);
+const port = Number(process.env.PORT || 8794);
 app.listen(port, '127.0.0.1', () => {
   console.log(`ProBoost Creator CRM review UI: http://127.0.0.1:${port}`);
 });

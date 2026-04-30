@@ -2,6 +2,7 @@ const { launchProBoostSession, persistAuthSnapshot } = require('./session');
 const {
   searchInboxByHandle,
   openInboxResult,
+  reopenInboxResult,
   replyToOpenedThread,
   verifySentRecord,
   enterRepliedInbox,
@@ -76,6 +77,31 @@ function renderFollowup(template, variables) {
   if (!template) return null;
   const rendered = renderTemplate(template, variables);
   return rendered.ok ? rendered : null;
+}
+
+function summarizeReadyFollowupRun({ runId, dryRun, maxPages, results, pageIndex = 1, scannedRows = 0, note = '' }) {
+  return {
+    runId,
+    dryRun,
+    maxPages,
+    pageIndex,
+    scannedRows,
+    note,
+    processed: results.length,
+    opened: results.filter(item => item.opened).length,
+    threadRead: results.filter(item => item.threadChars > 0).length,
+    openFailed: results.filter(item => item.stage === 'open-failed').length,
+    readyCount: results.filter(item => item.classification?.intent === 'ready').length,
+    whatsappFollowups: results.filter(item => item.classification?.recommendedAction === 'send_whatsapp_followup').length,
+    registerFollowups: results.filter(item => item.classification?.recommendedAction === 'send_register_followup').length,
+    skippedRegistered: results.filter(item => item.classification?.recommendedAction === 'skip_registered').length,
+    results,
+  };
+}
+
+async function emitReadyFollowupProgress(options, snapshot) {
+  if (typeof options.onProgress !== 'function') return;
+  await options.onProgress(snapshot);
 }
 
 async function returnToRepliedPage(page, pageIndex) {
@@ -237,6 +263,8 @@ async function runReadyFollowupBatch(db, options) {
   const readyKeywords = parseList(options.readyKeywords).length > 0 ? parseList(options.readyKeywords) : undefined;
   const runId = `ready_${new Date().toISOString().replace(/[:.]/g, '-')}`;
   const results = [];
+  let latestScannedRows = 0;
+  let latestPageIndex = 1;
 
   const { context, page } = await launchProBoostSession({
     headless: options.headless,
@@ -245,11 +273,31 @@ async function runReadyFollowupBatch(db, options) {
 
   try {
     await returnToRepliedPage(page, 1);
+    await emitReadyFollowupProgress(options, summarizeReadyFollowupRun({
+      runId,
+      dryRun,
+      maxPages,
+      results,
+      pageIndex: 1,
+      scannedRows: 0,
+      note: 'entered-replied-inbox',
+    }));
 
     let pageIndex = 1;
     let processed = 0;
     while (pageIndex <= maxPages) {
+      latestPageIndex = pageIndex;
       const rows = await extractInboxRows(page);
+      latestScannedRows = rows.length;
+      await emitReadyFollowupProgress(options, summarizeReadyFollowupRun({
+        runId,
+        dryRun,
+        maxPages,
+        results,
+        pageIndex,
+        scannedRows: rows.length,
+        note: 'listed-inbox-rows',
+      }));
       if (rows.length === 0) break;
 
       for (let rowIndex = 0; rowIndex < rows.length; rowIndex += 1) {
@@ -260,16 +308,87 @@ async function runReadyFollowupBatch(db, options) {
         let classification = null;
         let templateName = null;
         let rendered = null;
+        const resultItem = {
+          page: pageIndex,
+          rowIndex,
+          sender: row.sender,
+          subject: row.subject,
+          time: row.time,
+          status: 'listed',
+          stage: 'listed',
+          template: null,
+          classification: null,
+          opened: false,
+          threadChars: 0,
+        };
+        results.push(resultItem);
+        await emitReadyFollowupProgress(options, summarizeReadyFollowupRun({
+          runId,
+          dryRun,
+          maxPages,
+          results,
+          pageIndex,
+          scannedRows: latestScannedRows,
+          note: 'row-listed',
+        }));
 
         try {
-          await openInboxResult(page, row);
+          resultItem.status = 'opening';
+          resultItem.stage = 'opening';
+          await emitReadyFollowupProgress(options, summarizeReadyFollowupRun({
+            runId,
+            dryRun,
+            maxPages,
+            results,
+            pageIndex,
+            scannedRows: latestScannedRows,
+            note: 'opening-thread',
+          }));
+
+          await reopenInboxResult(page, row, pageIndex);
+          resultItem.opened = true;
+          resultItem.status = 'opened';
+          resultItem.stage = 'opened';
+          await emitReadyFollowupProgress(options, summarizeReadyFollowupRun({
+            runId,
+            dryRun,
+            maxPages,
+            results,
+            pageIndex,
+            scannedRows: latestScannedRows,
+            note: 'thread-opened',
+          }));
+
           const threadText = await extractOpenedThreadText(page);
+          resultItem.threadChars = threadText.length;
+          resultItem.stage = 'thread-read';
+          await emitReadyFollowupProgress(options, summarizeReadyFollowupRun({
+            runId,
+            dryRun,
+            maxPages,
+            results,
+            pageIndex,
+            scannedRows: latestScannedRows,
+            note: 'thread-read',
+          }));
+
           classification = classifyInboxReply({
             row,
             threadText,
             registeredNames,
             readyKeywords,
           });
+          resultItem.classification = classification;
+          resultItem.stage = 'classified';
+          await emitReadyFollowupProgress(options, summarizeReadyFollowupRun({
+            runId,
+            dryRun,
+            maxPages,
+            results,
+            pageIndex,
+            scannedRows: latestScannedRows,
+            note: 'classified',
+          }));
 
           if (classification.recommendedAction === 'ignore' || classification.recommendedAction === 'skip_registered') {
             status = classification.recommendedAction;
@@ -300,10 +419,13 @@ async function runReadyFollowupBatch(db, options) {
               inviteCode,
             });
             status = replyResult.status;
+            resultItem.stage = 'reply-prepared';
           }
         } catch (error) {
           status = 'failed';
           errorMessage = error.message;
+          if (resultItem.stage === 'opening') resultItem.stage = 'open-failed';
+          else resultItem.stage = 'failed';
         }
 
         insertSendLog(db, {
@@ -316,16 +438,22 @@ async function runReadyFollowupBatch(db, options) {
           run_id: runId,
         });
 
-        results.push({
-          page: pageIndex,
-          rowIndex,
-          sender: row.sender,
-          subject: row.subject,
-          status,
-          template: templateName,
-          classification,
-          error: errorMessage || undefined,
-        });
+        resultItem.status = status;
+        resultItem.stage = resultItem.stage === 'reply-prepared' || resultItem.stage === 'open-failed' || resultItem.stage === 'failed'
+          ? resultItem.stage
+          : 'done';
+        resultItem.template = templateName;
+        resultItem.classification = classification;
+        resultItem.error = errorMessage || undefined;
+        await emitReadyFollowupProgress(options, summarizeReadyFollowupRun({
+          runId,
+          dryRun,
+          maxPages,
+          results,
+          pageIndex,
+          scannedRows: latestScannedRows,
+          note: 'row-finished',
+        }));
 
         processed += 1;
         if (limit > 0 && processed >= limit) break;
@@ -344,15 +472,15 @@ async function runReadyFollowupBatch(db, options) {
   }
 
   return {
-    runId,
-    dryRun,
-    maxPages,
-    processed: results.length,
-    readyCount: results.filter(item => item.classification?.intent === 'ready').length,
-    whatsappFollowups: results.filter(item => item.classification?.recommendedAction === 'send_whatsapp_followup').length,
-    registerFollowups: results.filter(item => item.classification?.recommendedAction === 'send_register_followup').length,
-    skippedRegistered: results.filter(item => item.classification?.recommendedAction === 'skip_registered').length,
-    results,
+    ...summarizeReadyFollowupRun({
+      runId,
+      dryRun,
+      maxPages,
+      results,
+      pageIndex: latestPageIndex,
+      scannedRows: latestScannedRows,
+      note: 'finished',
+    }),
   };
 }
 

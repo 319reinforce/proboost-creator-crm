@@ -10,6 +10,35 @@ function senderMatchesHandle(sender, handle) {
   return normalizeKey(sender) === normalizeKey(handle);
 }
 
+async function clickVisibleExactText(page, label, selectors = 'button, [role="button"], a, div, span') {
+  return await page.evaluate(({ label, selectors }) => {
+    const normalize = value => String(value || '').replace(/\s+/g, '').trim();
+    const visible = element => {
+      if (!element) return false;
+      const style = window.getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return style.display !== 'none'
+        && style.visibility !== 'hidden'
+        && style.opacity !== '0'
+        && rect.width > 0
+        && rect.height > 0;
+    };
+    const candidates = Array.from(document.querySelectorAll(selectors))
+      .filter(visible)
+      .filter(element => normalize(element.innerText || element.textContent || '') === normalize(label))
+      .map(element => {
+        const rect = element.getBoundingClientRect();
+        return { element, area: rect.width * rect.height, y: rect.top };
+      })
+      .sort((a, b) => a.area - b.area || a.y - b.y);
+    const target = candidates[0]?.element;
+    if (!target) return false;
+    target.scrollIntoView({ block: 'center', inline: 'nearest' });
+    target.click();
+    return true;
+  }, { label, selectors }).catch(() => false);
+}
+
 async function waitForInboxTable(page, timeout = 30000) {
   try {
     await page.waitForFunction(() => {
@@ -27,9 +56,24 @@ async function waitForInboxTable(page, timeout = 30000) {
   }
 }
 
+async function goToMailModule(page) {
+  const clicked = await clickVisibleExactText(page, '邮件', 'button, [role="button"], a, nav *, aside *, div, span');
+  if (clicked) await page.waitForTimeout(1800);
+  return clicked;
+}
+
 async function goToInbox(page) {
   await page.goto(config.proboostUrl, { waitUntil: 'domcontentloaded', timeout: config.pageLoadTimeout });
   await page.waitForTimeout(1800);
+  const loginRequired = await page.evaluate(() => {
+    const text = document.body?.innerText || '';
+    return window.location.href.includes('/login')
+      || (text.includes('欢迎使用ProBoost.ai') && text.includes('验证码登录'));
+  }).catch(() => false);
+  if (loginRequired) {
+    throw new Error(`ProBoost login required. Open the CRM login action and complete login for profile: ${config.auth.profilePath}`);
+  }
+  await goToMailModule(page);
 
   await page.evaluate(() => {
     const normalize = value => String(value || '').replace(/\s+/g, '').trim();
@@ -39,7 +83,7 @@ async function goToInbox(page) {
   }).catch(() => {});
   await page.waitForTimeout(800);
 
-  const clicked = await page.evaluate(() => {
+  let clicked = await page.evaluate(() => {
     const normalize = value => String(value || '').replace(/\s+/g, '').trim();
     const candidates = Array.from(document.querySelectorAll('.mail-left .main-left-tab, .main-left-tab, [class*="left-tab"], nav button, aside button, button, a'));
     const target = candidates.find(el => normalize(el.innerText || el.textContent || '') === '收件箱');
@@ -48,6 +92,10 @@ async function goToInbox(page) {
     target.click();
     return true;
   }).catch(() => false);
+
+  if (!clicked) {
+    clicked = await clickVisibleExactText(page, '收件箱');
+  }
 
   if (!clicked) {
     const inbox = page.locator('text=收件箱').first();
@@ -147,8 +195,16 @@ async function selectMailStatus(page, statusText) {
 
 async function enterRepliedInbox(page) {
   await goToInbox(page);
-  await selectMailStatus(page, '已回复');
-  await waitForInboxTable(page, 15000);
+  const selected = await selectMailStatus(page, '已回复');
+  if (!selected) throw new Error('mail status filter "已回复" not found');
+  const ok = await waitForInboxTable(page, 15000);
+  if (!ok) {
+    const preview = await page.evaluate(() => ({
+      url: window.location.href,
+      text: (document.body?.innerText || '').slice(0, 800),
+    })).catch(error => ({ url: '', text: error.message }));
+    throw new Error(`Replied inbox table not ready. url=${preview.url}; text=${preview.text}`);
+  }
 }
 
 async function setPageSize(page, preferredSize = config.pageSize) {
@@ -359,49 +415,130 @@ async function searchInboxByHandle(page, handle) {
 }
 
 async function clickInboxRow(page, rowIndex) {
-  const rows = page.locator('table tbody tr:not(.ant-table-placeholder), .ant-table-tbody .ant-table-row:not(.ant-table-placeholder)');
-  const row = rows.nth(rowIndex);
-  if (await row.isVisible().catch(() => false)) {
-    const subjectTarget = row.locator('td').nth(2).locator('.cursor-pointer, .inbox-mail-receiving-tit, span, div').first();
-    if (await subjectTarget.isVisible().catch(() => false)) {
-      await subjectTarget.click({ timeout: 5000 }).catch(() => {});
-      await page.waitForTimeout(800);
-      return true;
-    }
-  }
-
-  return await page.evaluate((idx) => {
+  const clicked = await page.evaluate((idx) => {
     const rows = Array.from(document.querySelectorAll('table tbody tr, .ant-table-tbody .ant-table-row'))
       .filter(row => !row.classList.contains('ant-table-placeholder'));
     const row = rows[idx];
     if (!row) return false;
     const cells = row.querySelectorAll('td, .ant-table-cell');
-    const target = cells[2]?.querySelector('.cursor-pointer, .inbox-mail-receiving-tit, span, div')
+    const target = cells[1]?.querySelector('.cursor-pointer, .inbox-mail-receiving-tit, span, div')
+      || cells[2]?.querySelector('.cursor-pointer, .inbox-mail-receiving-tit, span, div')
+      || cells[1]
       || cells[2]
       || row;
     target.scrollIntoView({ block: 'center', inline: 'nearest' });
     target.click();
     return true;
   }, rowIndex).catch(() => false);
+  if (clicked) await page.waitForTimeout(1200);
+  return clicked;
+}
+
+async function clickInboxRowInMailTable(page, rowIndex, cellOrder = [1, 2]) {
+  const clicked = await page.evaluate(({ idx, cellOrder }) => {
+    const visible = element => {
+      if (!element) return false;
+      const style = window.getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return style.display !== 'none'
+        && style.visibility !== 'hidden'
+        && style.opacity !== '0'
+        && rect.width > 0
+        && rect.height > 0;
+    };
+    const tables = Array.from(document.querySelectorAll('table, .ant-table'));
+    const table = tables.find(item => {
+      const text = item.innerText || '';
+      return text.includes('发件人') && text.includes('送达时间');
+    });
+    if (!table) return false;
+    const rows = Array.from(table.querySelectorAll('tbody tr, .ant-table-tbody .ant-table-row'))
+      .filter(row => !row.classList.contains('ant-table-placeholder') && visible(row));
+    const row = rows[idx];
+    if (!row) return false;
+    const cells = row.querySelectorAll('td, .ant-table-cell');
+
+    let target = null;
+    for (const cellIndex of cellOrder) {
+      const cell = cells[cellIndex];
+      if (!cell) continue;
+      target = cell.querySelector('.cursor-pointer, .inbox-mail-receiving-tit, span, div') || cell;
+      if (target && visible(target)) break;
+    }
+    target = target || row;
+    target.scrollIntoView({ block: 'center', inline: 'nearest' });
+    const rect = target.getBoundingClientRect();
+    const options = {
+      bubbles: true,
+      cancelable: true,
+      view: window,
+      clientX: rect.left + rect.width / 2,
+      clientY: rect.top + rect.height / 2,
+    };
+    for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+      target.dispatchEvent(new MouseEvent(type, options));
+    }
+    return true;
+  }, { idx: rowIndex, cellOrder }).catch(() => false);
+
+  if (clicked) await page.waitForTimeout(1500);
+  return clicked;
 }
 
 async function waitForEmailDetail(page, row, timeout = 12000) {
   return await page.waitForFunction((expected) => {
+    const normalize = value => String(value || '').replace(/\s+/g, ' ').trim();
     const text = document.body?.innerText || '';
-    return text.includes('邮件详情')
-      && text.includes('返回收件箱')
-      && (!expected.sender || text.includes(expected.sender))
-      && (!expected.subject || text.includes(expected.subject.slice(0, 20)));
+    const hasDetailChrome = text.includes('邮件详情')
+      || text.includes('返回收件箱')
+      || Array.from(document.querySelectorAll('button, [role="button"], a')).some(element => {
+        const label = normalize(element.innerText || element.textContent || '');
+        return label === '回复' || label === '回复邮件';
+      });
+    const senderOk = !expected.sender || text.includes(expected.sender);
+    const subjectOk = !expected.subject || text.includes(String(expected.subject).slice(0, 20));
+    return hasDetailChrome && senderOk && subjectOk;
   }, row, { timeout }).then(() => true).catch(() => false);
 }
 
 async function openInboxResult(page, row) {
-  const opened = await clickInboxRow(page, row.rowIndex);
-  const detailReady = opened ? await waitForEmailDetail(page, row) : false;
-  if (!opened || !detailReady) {
-    throw new Error(opened ? 'email detail did not open' : 'failed to click inbox row');
+  const attempts = [
+    () => clickInboxRowInMailTable(page, row.rowIndex, [1, 2]),
+    () => clickInboxRowInMailTable(page, row.rowIndex, [2, 1]),
+    () => clickInboxRow(page, row.rowIndex),
+  ];
+
+  for (const attempt of attempts) {
+    const opened = await attempt();
+    const detailReady = opened ? await waitForEmailDetail(page, row) : false;
+    if (detailReady) return true;
   }
-  return true;
+
+  const preview = await page.evaluate(() => ({
+    url: window.location.href,
+    text: (document.body?.innerText || '').slice(0, 700),
+  })).catch(error => ({ url: '', text: error.message }));
+  throw new Error(`email detail did not open; row=${row.rowIndex}; sender=${row.sender || ''}; subject=${row.subject || ''}; url=${preview.url}; text=${preview.text}`);
+}
+
+async function reopenInboxResult(page, row, pageIndex = 1) {
+  try {
+    return await openInboxResult(page, row);
+  } catch (firstError) {
+    await enterRepliedInbox(page);
+    await setPageSize(page, config.pageSize);
+    await goToFirstPage(page);
+    for (let i = 1; i < pageIndex; i += 1) {
+      const advanced = await goToNextPage(page);
+      if (!advanced) break;
+    }
+    try {
+      return await openInboxResult(page, row);
+    } catch (secondError) {
+      secondError.message = `${secondError.message}; firstAttempt=${firstError.message}`;
+      throw secondError;
+    }
+  }
 }
 
 async function extractOpenedThreadText(page) {
@@ -647,6 +784,7 @@ async function replyToOpenedThread(page, { templateName, rendered, dryRun, invit
 module.exports = {
   searchInboxByHandle,
   openInboxResult,
+  reopenInboxResult,
   replyToOpenedThread,
   verifySentRecord,
   senderMatchesHandle,

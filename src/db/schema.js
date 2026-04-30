@@ -142,6 +142,22 @@ CREATE TABLE IF NOT EXISTS manual_review_items (
   FOREIGN KEY (creator_id) REFERENCES creators(id),
   FOREIGN KEY (thread_id) REFERENCES mail_threads(id)
 );
+
+CREATE TABLE IF NOT EXISTS task_runs (
+  id TEXT PRIMARY KEY,
+  type TEXT NOT NULL,
+  status TEXT NOT NULL,
+  manifest_path TEXT,
+  batch_number TEXT,
+  template_name TEXT,
+  payload_json TEXT,
+  result_json TEXT,
+  error TEXT,
+  started_at TEXT NOT NULL,
+  finished_at TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 `;
 
 const SEED = `

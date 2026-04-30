@@ -43,7 +43,16 @@ async function launchProBoostSession(options = {}) {
     launchOptions.storageState = config.auth.statePath;
   }
 
-  const context = await chromium.launchPersistentContext(config.auth.profilePath, launchOptions);
+  let context;
+  try {
+    context = await chromium.launchPersistentContext(config.auth.profilePath, launchOptions);
+  } catch (error) {
+    const message = String(error.message || error);
+    if (message.includes('ProcessSingleton') || message.includes('SingletonLock') || message.includes('profile is already in use')) {
+      throw new Error(`ProBoost browser profile is already open. Finish login and close the ProBoost login window before starting inbox checks. profile=${config.auth.profilePath}`);
+    }
+    throw error;
+  }
   const page = await getPage(context);
   await hydrateCookies(context);
   return { context, page };

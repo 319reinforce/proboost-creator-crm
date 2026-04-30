@@ -171,6 +171,108 @@ function insertSendLog(db, log) {
   return db.prepare('SELECT * FROM send_logs WHERE id = ?').get(result.lastInsertRowid);
 }
 
+function serializeJson(value) {
+  return value == null ? null : JSON.stringify(value);
+}
+
+function parseTaskRun(row) {
+  if (!row) return null;
+  return {
+    id: row.id,
+    type: row.type,
+    status: row.status,
+    manifestPath: row.manifest_path,
+    batchNumber: row.batch_number,
+    templateName: row.template_name,
+    payload: row.payload_json ? JSON.parse(row.payload_json) : null,
+    result: row.result_json ? JSON.parse(row.result_json) : null,
+    error: row.error || '',
+    startedAt: row.started_at,
+    finishedAt: row.finished_at || '',
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+function upsertTaskRun(db, task) {
+  db.prepare(`
+    INSERT INTO task_runs (
+      id,
+      type,
+      status,
+      manifest_path,
+      batch_number,
+      template_name,
+      payload_json,
+      result_json,
+      error,
+      started_at,
+      finished_at
+    )
+    VALUES (
+      @id,
+      @type,
+      @status,
+      @manifest_path,
+      @batch_number,
+      @template_name,
+      @payload_json,
+      @result_json,
+      @error,
+      @started_at,
+      @finished_at
+    )
+    ON CONFLICT(id) DO UPDATE SET
+      status = excluded.status,
+      manifest_path = excluded.manifest_path,
+      batch_number = excluded.batch_number,
+      template_name = excluded.template_name,
+      payload_json = excluded.payload_json,
+      result_json = excluded.result_json,
+      error = excluded.error,
+      finished_at = excluded.finished_at,
+      updated_at = CURRENT_TIMESTAMP
+  `).run({
+    id: task.id,
+    type: task.type,
+    status: task.status,
+    manifest_path: task.manifestPath || null,
+    batch_number: task.batchNumber || null,
+    template_name: task.templateName || null,
+    payload_json: serializeJson(task.payload),
+    result_json: serializeJson(task.result),
+    error: task.error || null,
+    started_at: task.startedAt,
+    finished_at: task.finishedAt || null,
+  });
+
+  return parseTaskRun(db.prepare('SELECT * FROM task_runs WHERE id = ?').get(task.id));
+}
+
+function updateTaskRun(db, id, patch) {
+  const current = parseTaskRun(db.prepare('SELECT * FROM task_runs WHERE id = ?').get(id));
+  if (!current) return null;
+  return upsertTaskRun(db, { ...current, ...patch, id });
+}
+
+function listTaskRuns(db, { type, limit = 20 } = {}) {
+  const rows = type
+    ? db.prepare(`
+      SELECT *
+      FROM task_runs
+      WHERE type = ?
+      ORDER BY started_at DESC
+      LIMIT ?
+    `).all(type, limit)
+    : db.prepare(`
+      SELECT *
+      FROM task_runs
+      ORDER BY started_at DESC
+      LIMIT ?
+    `).all(limit);
+  return rows.map(parseTaskRun);
+}
+
 module.exports = {
   openDb,
   initDb,
@@ -179,4 +281,7 @@ module.exports = {
   upsertInviteCode,
   markInviteUsed,
   insertSendLog,
+  upsertTaskRun,
+  updateTaskRun,
+  listTaskRuns,
 };

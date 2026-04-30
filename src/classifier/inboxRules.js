@@ -32,10 +32,20 @@ function extractPhoneNumbers(text) {
 }
 
 function containsAnyKeyword(text, keywords = DEFAULT_READY_KEYWORDS) {
-  const haystack = normalizeKey(text);
+  const haystack = normalizeText(text);
   return keywords.some(keyword => {
-    const needle = normalizeKey(keyword);
-    return needle && haystack.includes(needle);
+    const needle = normalizeText(keyword);
+    if (!needle) return false;
+    const explicitRegex = needle.match(/^\/(.+)\/([a-z]*)$/i);
+    if (explicitRegex) {
+      try {
+        return new RegExp(explicitRegex[1], explicitRegex[2] || 'iu').test(haystack);
+      } catch {
+        return false;
+      }
+    }
+    const escaped = needle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(`(^|[^\\p{L}\\p{N}_])${escaped}([^\\p{L}\\p{N}_]|$)`, 'iu').test(haystack);
   });
 }
 
@@ -87,5 +97,6 @@ module.exports = {
   normalizeKey,
   extractInviteCodes,
   extractPhoneNumbers,
+  containsAnyKeyword,
   classifyInboxReply,
 };

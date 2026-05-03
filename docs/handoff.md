@@ -1,122 +1,154 @@
 # ProBoost Creator CRM Handoff
 
-## Boundaries
+## Required Reading
 
-Do not modify these legacy projects directly:
+Before editing code, read these documents in order:
+
+1. `docs/agent-git-workflow.md`
+2. `docs/send-mail-sqlite-migration-plan.md`
+3. `docs/followup-optimization-plan.md` if touching inbox classification, second-touch follow-up, LLM classification, or mail automation
+4. This handoff document
+
+The send-mail migration plan is the source of truth for the manifest-to-SQLite and frontend modernization roadmap. Do not continue send-mail work from memory; re-read the plan first.
+
+## Current Direction
+
+The project is moving away from:
+
+- server-side giant HTML string rendering in `src/web/server.js`
+- `manifest.json` as durable batch state
+- direct dependence on `/Users/depp/send-mail`
+
+The target is:
+
+- SQLite-owned campaign, batch, run, and send state
+- Express as API/orchestration layer
+- React/Vite/Tailwind frontend for operator UI
+- internal CRM-owned automation code, eventually removing `/Users/depp/send-mail` as a runtime dependency
+
+## Migration Status
+
+### Completed
+
+- Phase 1: database landing zone
+  - `send_mail_campaigns`
+  - `send_mail_batches`
+  - manifest-to-SQLite upsert helper
+  - split/run sync into SQLite
+
+- Phase 3: atomic batch claims and crash recovery
+  - `task_run_id`
+  - `claimed_at`
+  - `claimed_by`
+  - `last_heartbeat_at`
+  - `attempt_count`
+  - atomic `pending -> sending/preparing` claim
+  - runner heartbeat
+  - nonzero runner failure release
+  - stale `sending/preparing` recovery on web startup and every minute
+
+### In Progress
+
+- Phase 2 frontend modernization
+  - React/Vite/Tailwind dashboard skeleton exists in `src/web/client/`
+  - `/api/dashboard` exists
+  - `/dashboard` has a fallback if the frontend bundle is not built
+  - `npm install` was blocked by sandbox network, so dependencies and `package-lock.json` may need attention before build verification
+
+### Not Yet Done
+
+- Phase 4: runtime bridge that lets legacy automation update SQLite directly
+- Phase 5: manifest retirement
+- Phase 6: internalize `/Users/depp/send-mail` split/send logic into this repo
+
+## Current Important Files
+
+Send-mail state migration:
+
+- `docs/send-mail-sqlite-migration-plan.md`
+- `src/db/schema.js`
+- `src/db/index.js`
+- `src/sendMailBridge/engine.js`
+- `src/sendMailBridge/syncToCrm.js`
+- `src/sendMailBridge/runtimeScript.js`
+
+Web frontend migration:
+
+- `src/web/server.js`
+- `src/web/client/main.jsx`
+- `src/web/client/styles.css`
+- `vite.config.js`
+- `package.json`
+
+Legacy adapters and follow-up work:
+
+- `src/automation/reminderRunner.js`
+- `src/automation/mailClient.js`
+- `src/automation/domActions.js`
+- `src/automation/selectors.js`
+- `src/classifier/llmClassifier.js`
+- `src/legacyAdapters/proboostReadyReminder.js`
+
+## Legacy Boundaries
+
+Do not modify these external projects directly unless the user explicitly asks:
 
 - `/Users/depp/send-mail`
 - `/Users/depp/proboost-ready-reminder`
 
-Treat them as read-only execution engines and reference implementations. New behavior, state interpretation, status mapping, preflight checks, logs, reports, and UI should live in `proboost-creator-crm`.
+Treat them as read-only execution engines and reference implementations. New behavior, state interpretation, status mapping, preflight checks, logs, reports, and UI should live in this repo.
 
-## Current Integration
+The long-term goal is Phase 6: move the relevant split and Playwright send logic into this repo so the CRM is clone-and-run.
 
-`send-mail` is already wrapped through:
+## Known Verification Gaps
 
-- `src/sendMailBridge/paths.js`
-- `src/sendMailBridge/engine.js`
-- `src/sendMailBridge/manifest.js`
-- `src/web/server.js`
-
-The web review console runs at:
-
-```text
-http://127.0.0.1:8787
-```
-
-It supports xlsx upload, split manifests, work-order cards, paginated review, background send jobs, and log summaries.
-
-## Legacy Compatibility Plan
-
-`proboost-ready-reminder` should be integrated through a CRM-side adapter, not by editing the legacy scripts.
-
-Legacy entry points:
-
-- `save-proboost-auth.js`: saves ProBoost auth state.
-- `unused-invite-reminder.js`: computes pushed invite codes that are not ready/registered, searches inbox, and sends or dry-runs reminder replies.
-- `proboost-replied.js`: scans replied mail, detects ready replies, extracts invite code/phone, and sends the appropriate reminder template.
-
-CRM adapter goals:
-
-1. Run legacy scripts from CRM commands.
-2. Redirect reports and logs into CRM-owned folders.
-3. Keep legacy auth in CRM-owned `.legacy-auth`.
-4. Preserve default dry-run safety for unused invite reminders.
-5. Require an explicit `--send` flag before running `proboost-replied.js`, because that legacy script sends by design.
-6. Normalize legacy output into CRM-readable summaries.
-
-Implemented CRM-side files:
-
-- `src/legacyAdapters/proboostReadyReminder.js`
-- `src/cli/index.js` legacy subcommands
-
-Available commands:
+The following checks passed:
 
 ```bash
-npm run legacy:ready-login
-npm run legacy:unused -- --push /path/to/push --ready /path/to/ready --limit 5
-npm run legacy:unused -- --push /path/to/push --ready /path/to/ready --send
-npm run legacy:replied -- --send --whitelist /path/to/registered.xlsx
+node -c src/db/index.js
+node -c src/db/schema.js
+node -c src/sendMailBridge/engine.js
+node -c src/web/server.js
 ```
 
-Safety defaults:
+The Phase 3 DB behavior was verified against a temporary SQLite database:
 
-- `legacy unused` runs with `DRY_RUN=1` unless `--send` is explicitly passed.
-- `legacy replied` refuses to run unless `--send` is passed, because the legacy script sends by design.
-- Both adapters redirect `REPORT_DIR` and `PROBOOST_AUTH_ROOT` into CRM-owned folders.
+- duplicate claim is rejected
+- pending batch claim succeeds
+- heartbeat updates active rows
+- runner failure release marks rows failed
+- stale recovery marks timed-out rows failed
+- stale recovery exposes manifest paths for temporary legacy UI compatibility
 
-## CRM-Owned Runtime Locations
+The following checks were blocked by sandbox/network restrictions:
 
-Legacy compatibility outputs should stay inside this project:
-
-```text
-reports/legacy-runs/
-.legacy-auth/
+```bash
+npm install
+npm run web:build
+npm run web
 ```
 
-The adapter may read source scripts and input files from the legacy project, but should not write generated reports or auth state into the legacy project unless an operator explicitly opts into that later.
+`npm install` failed in sandbox because `registry.npmjs.org` could not resolve. Attempts to request elevated network install timed out. `npm run web` failed in sandbox with `listen EPERM 127.0.0.1:8794`; elevated run also timed out.
 
-## Next Development Steps
+Before claiming the frontend migration is complete, install dependencies, build the frontend bundle, start the server, and inspect `/dashboard`.
 
-1. CRM status interpretation layer
-   - Map `success-toast-not-found` to `send-confirmed / verify-missed`.
-   - Map import timeouts with empty email columns to `likely-zero-reachable`.
-   - Map `ProcessSingleton` to `profile-occupied`.
-
-2. Batch preflight
-   - Read each split xlsx in CRM.
-   - Compute `rowCount`, `handleCount`, `emailCount`, and `likelyReachable`.
-   - Show those values in the work-order UI before sending.
-
-3. Resume controls
-   - Send pending.
-   - Continue from batch N.
-   - Retry non-zero-reachable failed batches.
-   - Mark confirmed / skipped / retry-needed.
-
-4. Legacy compatibility UI
-   - Add a small legacy jobs panel for `proboost-ready-reminder`.
-   - Show latest dry-run/send report summaries.
-   - Link to CRM-owned legacy logs.
-
-5. Per-work-order log archive
-   - Move from a flat `reports/send-mail-runs/` folder toward:
-
-```text
-reports/send-mail-runs/{campaign}/
-  split.log
-  send.log
-  run-summary.json
-```
-
-## Operational Notes
+## Operational Safety
 
 - Never start two headed Edge automation processes with the same profile at once.
-- If a profile conflict appears, inspect:
-
-```bash
-ps -axo pid,ppid,command | rg '/Users/depp/send-mail/proboost-auto.js|send-mail/.proboost-auth/default/edge-profile|proboost-ready-reminder'
-```
-
-- If cleanup is needed, only stop the specific legacy automation `node` process. Do not kill the user's normal Edge process.
 - All real sends must remain headed and visible.
+- Do not kill the user's normal browser processes.
+- If cleanup is needed, stop only the specific legacy automation `node` process.
+- If a batch is stuck in `sending` or `preparing`, prefer the SQLite stale recovery path over hand-editing JSON.
+- Remember that `manifest.json` is still a compatibility artifact until Phase 5 is complete.
+
+## Suggested Next Step
+
+If continuing the current roadmap, do this next:
+
+1. Resolve frontend dependency installation and lockfile state.
+2. Run `npm run web:build`.
+3. Start `npm run web`.
+4. Verify `/api/dashboard` and `/dashboard`.
+5. Continue Phase 2 by moving `/send` work orders from manifest scanning to SQLite-backed JSON APIs and React components.
+
+Do not jump to Phase 4/5 until Phase 2 is stable enough that the operator UI no longer depends on manifest scanning.

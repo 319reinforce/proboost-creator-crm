@@ -10,10 +10,11 @@ const {
   upsertTaskRun,
   updateTaskRun,
   listTaskRuns,
+  recoverStaleSendMailBatches,
 } = require('../db');
 const { loginInteractively } = require('../automation/session');
 const { runReadyFollowupBatch } = require('../automation/reminderRunner');
-const { listManifestPaths, readManifest } = require('../sendMailBridge/manifest');
+const { listManifestPaths, readManifest, updateBatchStatus } = require('../sendMailBridge/manifest');
 const {
   uploadsDir,
   batchesDir,
@@ -45,6 +46,7 @@ const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 app.use('/assets', express.static(path.join(__dirname, 'public')));
+app.use('/app', express.static(path.join(__dirname, 'public', 'app')));
 
 const webDb = initDb(openDb());
 webDb.prepare(`
@@ -55,8 +57,50 @@ webDb.prepare(`
       updated_at = CURRENT_TIMESTAMP
   WHERE status = 'running'
 `).run();
+function markRecoveredManifestBatches(recovered) {
+  const byManifest = new Map();
+  for (const batch of recovered) {
+    if (!batch.manifestPath) continue;
+    if (!byManifest.has(batch.manifestPath)) byManifest.set(batch.manifestPath, []);
+    byManifest.get(batch.manifestPath).push(batch.batchNumber);
+  }
+  for (const [manifestPath, batchNumbers] of byManifest.entries()) {
+    const manifest = readManifest(manifestPath);
+    if (!manifest) continue;
+    let changed = false;
+    for (const batchNumber of batchNumbers) {
+      const batch = manifest.batches?.find(item => Number(item.batchNumber) === Number(batchNumber));
+      if (!batch || !['sending', 'preparing'].includes(batch.status)) continue;
+      updateBatchStatus(manifest, batchNumber, 'failed', {
+        failedAt: new Date().toISOString(),
+        reason: 'runner-heartbeat-timeout',
+      });
+      changed = true;
+    }
+    if (changed) writeJson(manifestPath, manifest);
+  }
+}
+
+const recoveredOnStartup = recoverStaleSendMailBatches(webDb);
+markRecoveredManifestBatches(recoveredOnStartup);
+if (recoveredOnStartup.length > 0) {
+  console.log(`[recovery] marked ${recoveredOnStartup.length} stale send-mail batches as failed`);
+}
 const activeJobs = new Map();
 const eventClients = new Set();
+
+const staleBatchRecovery = setInterval(() => {
+  try {
+    const recovered = recoverStaleSendMailBatches(webDb);
+    markRecoveredManifestBatches(recovered);
+    if (recovered.length > 0) {
+      console.log(`[recovery] marked ${recovered.length} stale send-mail batches as failed`);
+    }
+  } catch (error) {
+    console.error(`[recovery-error] ${String(error.stack || error.message || error)}`);
+  }
+}, 60_000);
+staleBatchRecovery.unref?.();
 
 app.get('/events', (req, res) => {
   res.writeHead(200, {
@@ -95,7 +139,7 @@ function startJob({ type, manifestPath, batchNumber, templateName, task }) {
   });
   broadcastJob(job);
   Promise.resolve()
-    .then(task)
+    .then(() => task(job))
     .then(result => {
       job.status = 'finished';
       job.finishedAt = new Date().toISOString();
@@ -315,7 +359,7 @@ function renderWorkOrders(pageNumber = 1) {
         <td>${escapeHtml(path.basename(fixMojibake(batch.file || '')))}</td>
         <td>${escapeHtml(batch.rowCount || 0)}</td>
         <td>${escapeHtml(batch.selectedCount ?? '-')}</td>
-        <td><span class="status ${batch.reason === 'success-toast-not-found' ? 'failed' : escapeHtml(batch.status || '')}">${escapeHtml(statusLabel(batch))}</span></td>
+        <td><span class="status ${batch.reason === 'success-toast-not-found' ? 'prepared' : escapeHtml(batch.status || '')}">${escapeHtml(statusLabel(batch))}</span></td>
         <td>${escapeHtml(batch.reason || '')}</td>
       </tr>`).join('');
 
@@ -519,6 +563,20 @@ function renderSendPage(pageNumber) {
 }
 
 function renderDashboard() {
+  const dashboardBundle = path.join(__dirname, 'public', 'app', 'assets', 'main.js');
+  if (!fs.existsSync(dashboardBundle)) {
+    return `<section>
+      <h2>数据看板前端应用尚未构建</h2>
+      <p class="muted">Dashboard 已迁移为 React/Vite 应用。安装前端依赖后运行 <code>npm run web:build</code>，刷新本页即可加载新版看板。</p>
+      <pre>${escapeHtml(JSON.stringify(dashboardPayload(), null, 2))}</pre>
+    </section>`;
+  }
+  return `<link rel="stylesheet" href="/app/assets/main.css" />
+    <div id="dashboard-root"></div>
+    <script type="module" src="/app/assets/main.js"></script>`;
+}
+
+function dashboardPayload() {
   const manifests = listManifestPaths(batchesDir)
     .map(manifestPath => readManifest(manifestPath))
     .filter(Boolean);
@@ -529,33 +587,58 @@ function renderDashboard() {
     acc.rows += summary.totalRows;
     acc.pending += summary.pending;
     acc.sent += summary.sent;
+    acc.failed += summary.failed;
+    acc.prepared += summary.prepared;
+    acc.sending += summary.sending + summary.preparing;
     acc.unverified += summary.confirmedButUnverified;
+    acc.selected += summary.selected;
     return acc;
-  }, { workOrders: 0, batches: 0, rows: 0, pending: 0, sent: 0, unverified: 0 });
+  }, { workOrders: 0, batches: 0, rows: 0, pending: 0, sent: 0, failed: 0, prepared: 0, sending: 0, unverified: 0, selected: 0 });
+  const bridgeRows = webDb.prepare(`
+    SELECT status, COUNT(*) AS count
+    FROM send_logs
+    WHERE external_source = 'sendMailBridge'
+    GROUP BY status
+  `).all();
+  const bridgeSummary = bridgeRows.reduce((acc, row) => {
+    acc.total += Number(row.count || 0);
+    acc[row.status] = Number(row.count || 0);
+    return acc;
+  }, { total: 0 });
+  const sqliteCampaigns = webDb.prepare('SELECT COUNT(*) AS count FROM send_mail_campaigns').get();
+  const sqliteBatches = webDb.prepare(`
+    SELECT status, COUNT(*) AS count
+    FROM send_mail_batches
+    GROUP BY status
+  `).all();
+  const sqliteSummary = sqliteBatches.reduce((acc, row) => {
+    acc.batches += Number(row.count || 0);
+    acc[row.status] = Number(row.count || 0);
+    return acc;
+  }, { campaigns: Number(sqliteCampaigns?.count || 0), batches: 0 });
   const reports = listReadyFollowupReports();
   const latest = reports[0]?.payload;
-  return `<section>
-    <h2>数据看板</h2>
-    <div class="stats">
-      <span class="metric"><strong>${sendSummary.workOrders}</strong> 发信工单</span>
-      <span class="metric"><strong>${sendSummary.batches}</strong> 批次</span>
-      <span class="metric"><strong>${sendSummary.rows}</strong> 达人行数</span>
-      <span class="metric"><strong>${sendSummary.pending}</strong> 待发送</span>
-      <span class="metric"><strong>${sendSummary.unverified}</strong> 已确认待复核</span>
-      <span class="metric"><strong>${reports.length}</strong> 二次触达运行</span>
-    </div>
-    ${latest ? `<details open style="margin-top:16px">
-      <summary>最近二次触达</summary>
-      <div class="stats">
-        <span class="metric"><strong>${escapeHtml(latest.status)}</strong> 状态</span>
-        <span class="metric"><strong>${latest.result?.processed || 0}</strong> 已检查</span>
-        <span class="metric"><strong>${latest.result?.readyCount || 0}</strong> ready</span>
-        <span class="metric"><strong>${latest.result?.whatsappFollowups || 0}</strong> 联系方式跟进</span>
-        <span class="metric"><strong>${latest.result?.registerFollowups || 0}</strong> 注册提醒</span>
-      </div>
-      ${latest.error ? `<pre>${escapeHtml(latest.error)}</pre>` : ''}
-    </details>` : '<p class="muted">还没有二次触达运行记录。</p>'}
-  </section>`;
+  return {
+    sendSummary,
+    bridgeSummary,
+    bridgeRows: bridgeRows
+      .map(row => ({
+        status: row.status,
+        label: row.status || '-',
+        count: Number(row.count || 0),
+      }))
+      .sort((a, b) => b.count - a.count),
+    sqliteSummary,
+    latestFollowup: latest ? {
+      id: latest.id || '',
+      status: latest.status || '',
+      startedAt: latest.startedAt || '',
+      finishedAt: latest.finishedAt || '',
+      error: latest.error || '',
+      result: latest.result || null,
+    } : null,
+    followupRuns: reports.length,
+  };
 }
 
 function followupSummaryPayload() {
@@ -628,6 +711,10 @@ app.get('/', (_req, res) => {
 
 app.get('/api/followup-summary', (_req, res) => {
   res.json(followupSummaryPayload());
+});
+
+app.get('/api/dashboard', (_req, res) => {
+  res.json(dashboardPayload());
 });
 
 app.get('/send', (req, res) => {
@@ -801,7 +888,11 @@ app.post('/batch/prepare', async (req, res, next) => {
       manifestPath: req.body.manifestPath,
       batchNumber: req.body.batchNumber,
       templateName: options.templateName,
-      task: () => runBatch(req.body.manifestPath, req.body.batchNumber, options),
+      task: job => runBatch(req.body.manifestPath, req.body.batchNumber, {
+        ...options,
+        taskRunId: job.id,
+        claimedBy: `web:${job.id}`,
+      }),
     });
     res.redirect(303, '/send');
   } catch (error) {
@@ -817,7 +908,11 @@ app.post('/batch/send', async (req, res, next) => {
       manifestPath: req.body.manifestPath,
       batchNumber: req.body.batchNumber,
       templateName: options.templateName,
-      task: () => runBatch(req.body.manifestPath, req.body.batchNumber, options),
+      task: job => runBatch(req.body.manifestPath, req.body.batchNumber, {
+        ...options,
+        taskRunId: job.id,
+        claimedBy: `web:${job.id}`,
+      }),
     });
     res.redirect(303, '/send');
   } catch (error) {
@@ -832,7 +927,11 @@ app.post('/batch/send-pending', async (req, res, next) => {
       type: 'send-pending',
       manifestPath: req.body.manifestPath,
       templateName: options.templateName,
-      task: () => runPending(req.body.manifestPath, options),
+      task: job => runPending(req.body.manifestPath, {
+        ...options,
+        taskRunId: job.id,
+        claimedBy: `web:${job.id}`,
+      }),
     });
     res.redirect(303, '/send');
   } catch (error) {
@@ -865,6 +964,9 @@ app.use((error, _req, res, _next) => {
 });
 
 const port = Number(process.env.PORT || 8794);
-app.listen(port, '127.0.0.1', () => {
+const server = app.listen(port, '127.0.0.1', () => {
   console.log(`ProBoost Creator CRM review UI: http://127.0.0.1:${port}`);
+});
+server.on('error', error => {
+  console.error(error.stack || error.message || error);
 });

@@ -15,7 +15,7 @@ const sharedAuthRoots = [
 ];
 const auth = resolveAuthConfig({ baseDir: rootDir, appName: 'proboost-creator-crm' });
 const sharedAuthRoot = sharedAuthRoots.find(item => fs.existsSync(item));
-if (!process.env.PROBOOST_AUTH_ROOT && sharedAuthRoot) {
+if (boolEnv('PROBOOST_USE_SHARED_AUTH', false) && !process.env.PROBOOST_AUTH_ROOT && sharedAuthRoot) {
   auth.authRoot = sharedAuthRoot;
   auth.userRoot = path.join(sharedAuthRoot, auth.userId);
   auth.profilePath = path.join(auth.userRoot, 'edge-profile');

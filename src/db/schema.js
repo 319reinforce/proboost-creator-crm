@@ -65,11 +65,59 @@ CREATE TABLE IF NOT EXISTS send_logs (
   error_message TEXT,
   screenshot_path TEXT,
   run_id TEXT,
+  external_source TEXT,
+  external_id TEXT,
+  payload_json TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (creator_id) REFERENCES creators(id),
   FOREIGN KEY (invite_code_id) REFERENCES invite_codes(id),
   FOREIGN KEY (template_id) REFERENCES templates(id),
   FOREIGN KEY (campaign_id) REFERENCES campaigns(id)
+);
+
+CREATE TABLE IF NOT EXISTS send_mail_campaigns (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  campaign_id INTEGER,
+  name TEXT NOT NULL UNIQUE,
+  manifest_path TEXT UNIQUE,
+  input_file TEXT,
+  output_dir TEXT,
+  original_upload TEXT,
+  batch_size INTEGER,
+  total_rows INTEGER NOT NULL DEFAULT 0,
+  source_total_rows INTEGER,
+  skip_data_rows INTEGER NOT NULL DEFAULT 0,
+  batch_count INTEGER NOT NULL DEFAULT 0,
+  split_log TEXT,
+  status TEXT NOT NULL DEFAULT 'pending',
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (campaign_id) REFERENCES campaigns(id)
+);
+
+CREATE TABLE IF NOT EXISTS send_mail_batches (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  send_mail_campaign_id INTEGER NOT NULL,
+  batch_number INTEGER NOT NULL,
+  file_path TEXT NOT NULL,
+  row_count INTEGER NOT NULL DEFAULT 0,
+  selected_count INTEGER,
+  status TEXT NOT NULL DEFAULT 'pending',
+  reason TEXT,
+  task_run_id TEXT,
+  claimed_at TEXT,
+  claimed_by TEXT,
+  last_heartbeat_at TEXT,
+  attempt_count INTEGER NOT NULL DEFAULT 0,
+  started_at TEXT,
+  sent_at TEXT,
+  failed_at TEXT,
+  updated_from_manifest_at TEXT,
+  payload_json TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (send_mail_campaign_id) REFERENCES send_mail_campaigns(id),
+  UNIQUE(send_mail_campaign_id, batch_number)
 );
 
 CREATE TABLE IF NOT EXISTS mail_threads (

@@ -1,4 +1,14 @@
 const config = require('../config');
+const { SELECTORS } = require('./selectors');
+const {
+  clickVisibleExactText,
+  findMailTable,
+  extractMailRows,
+  robustOpenMailRow,
+  waitForMailDetail,
+  captureDomFailure,
+  summarizeDomFailure,
+} = require('./domActions');
 
 const CONFIRM_TEXTS = ['确认', '确定'];
 
@@ -10,54 +20,12 @@ function senderMatchesHandle(sender, handle) {
   return normalizeKey(sender) === normalizeKey(handle);
 }
 
-async function clickVisibleExactText(page, label, selectors = 'button, [role="button"], a, div, span') {
-  return await page.evaluate(({ label, selectors }) => {
-    const normalize = value => String(value || '').replace(/\s+/g, '').trim();
-    const visible = element => {
-      if (!element) return false;
-      const style = window.getComputedStyle(element);
-      const rect = element.getBoundingClientRect();
-      return style.display !== 'none'
-        && style.visibility !== 'hidden'
-        && style.opacity !== '0'
-        && rect.width > 0
-        && rect.height > 0;
-    };
-    const candidates = Array.from(document.querySelectorAll(selectors))
-      .filter(visible)
-      .filter(element => normalize(element.innerText || element.textContent || '') === normalize(label))
-      .map(element => {
-        const rect = element.getBoundingClientRect();
-        return { element, area: rect.width * rect.height, y: rect.top };
-      })
-      .sort((a, b) => a.area - b.area || a.y - b.y);
-    const target = candidates[0]?.element;
-    if (!target) return false;
-    target.scrollIntoView({ block: 'center', inline: 'nearest' });
-    target.click();
-    return true;
-  }, { label, selectors }).catch(() => false);
-}
-
 async function waitForInboxTable(page, timeout = 30000) {
-  try {
-    await page.waitForFunction(() => {
-      const spinning = document.querySelector('.ant-spin-spinning');
-      if (spinning) return false;
-      const tables = Array.from(document.querySelectorAll('table'));
-      return tables.some(table => {
-        const text = table.innerText || '';
-        return text.includes('发件人') && text.includes('送达时间');
-      });
-    }, { timeout });
-    return true;
-  } catch {
-    return false;
-  }
+  return Boolean(await findMailTable(page, { timeout }));
 }
 
 async function goToMailModule(page) {
-  const clicked = await clickVisibleExactText(page, '邮件', 'button, [role="button"], a, nav *, aside *, div, span');
+  const clicked = await clickVisibleExactText(page, SELECTORS.mailModule.text, SELECTORS.mailModule.variants);
   if (clicked) await page.waitForTimeout(1800);
   return clicked;
 }
@@ -83,15 +51,7 @@ async function goToInbox(page) {
   }).catch(() => {});
   await page.waitForTimeout(800);
 
-  let clicked = await page.evaluate(() => {
-    const normalize = value => String(value || '').replace(/\s+/g, '').trim();
-    const candidates = Array.from(document.querySelectorAll('.mail-left .main-left-tab, .main-left-tab, [class*="left-tab"], nav button, aside button, button, a'));
-    const target = candidates.find(el => normalize(el.innerText || el.textContent || '') === '收件箱');
-    if (!target) return false;
-    target.scrollIntoView({ block: 'center', inline: 'nearest' });
-    target.click();
-    return true;
-  }).catch(() => false);
+  let clicked = await clickVisibleExactText(page, SELECTORS.inboxTab.text, SELECTORS.inboxTab.variants);
 
   if (!clicked) {
     clicked = await clickVisibleExactText(page, '收件箱');
@@ -105,11 +65,8 @@ async function goToInbox(page) {
   await page.waitForTimeout(2000);
   const ok = await waitForInboxTable(page);
   if (!ok) {
-    const preview = await page.evaluate(() => ({
-      url: window.location.href,
-      text: (document.body?.innerText || '').slice(0, 800),
-    })).catch(error => ({ url: '', text: error.message }));
-    throw new Error(`Inbox table not ready. url=${preview.url}; text=${preview.text}`);
+    const failure = await captureDomFailure(page, 'inbox-table-not-ready');
+    throw new Error(`Inbox table not ready. ${summarizeDomFailure(failure)}`);
   }
 }
 
@@ -199,11 +156,8 @@ async function enterRepliedInbox(page) {
   if (!selected) throw new Error('mail status filter "已回复" not found');
   const ok = await waitForInboxTable(page, 15000);
   if (!ok) {
-    const preview = await page.evaluate(() => ({
-      url: window.location.href,
-      text: (document.body?.innerText || '').slice(0, 800),
-    })).catch(error => ({ url: '', text: error.message }));
-    throw new Error(`Replied inbox table not ready. url=${preview.url}; text=${preview.text}`);
+    const failure = await captureDomFailure(page, 'replied-inbox-table-not-ready', { statusText: '已回复' });
+    throw new Error(`Replied inbox table not ready. ${summarizeDomFailure(failure)}`);
   }
 }
 
@@ -369,30 +323,7 @@ async function clickSearchButton(page) {
 }
 
 async function extractInboxRows(page) {
-  return await page.evaluate(() => {
-    const tables = Array.from(document.querySelectorAll('table, .ant-table'));
-    const table = tables.find(item => {
-      const text = item.innerText || '';
-      return text.includes('发件人') && text.includes('送达时间');
-    });
-    if (!table) return [];
-
-    const rowNodes = Array.from(table.querySelectorAll('tbody tr, .ant-table-tbody .ant-table-row'))
-      .filter(row => !row.classList.contains('ant-table-placeholder'));
-
-    return rowNodes.map((row, index) => {
-      const cells = Array.from(row.querySelectorAll('td, .ant-table-cell'));
-      if (cells.length >= 4) {
-        return {
-          rowIndex: index,
-          sender: (cells[1]?.innerText || cells[1]?.textContent || '').trim(),
-          subject: (cells[2]?.innerText || cells[2]?.textContent || '').trim(),
-          time: (cells[3]?.innerText || cells[3]?.textContent || '').trim(),
-        };
-      }
-      return null;
-    }).filter(Boolean).filter(row => row.sender || row.subject);
-  });
+  return await extractMailRows(page);
 }
 
 async function searchInboxByHandle(page, handle) {
@@ -415,90 +346,21 @@ async function searchInboxByHandle(page, handle) {
 }
 
 async function clickInboxRow(page, rowIndex) {
-  const clicked = await page.evaluate((idx) => {
-    const rows = Array.from(document.querySelectorAll('table tbody tr, .ant-table-tbody .ant-table-row'))
-      .filter(row => !row.classList.contains('ant-table-placeholder'));
-    const row = rows[idx];
-    if (!row) return false;
-    const cells = row.querySelectorAll('td, .ant-table-cell');
-    const target = cells[1]?.querySelector('.cursor-pointer, .inbox-mail-receiving-tit, span, div')
-      || cells[2]?.querySelector('.cursor-pointer, .inbox-mail-receiving-tit, span, div')
-      || cells[1]
-      || cells[2]
-      || row;
-    target.scrollIntoView({ block: 'center', inline: 'nearest' });
-    target.click();
-    return true;
-  }, rowIndex).catch(() => false);
-  if (clicked) await page.waitForTimeout(1200);
-  return clicked;
+  return await robustOpenMailRow(page, rowIndex, {
+    cellOrders: [[1, 2], [2, 1], [0, 1, 2]],
+    waitAfterMs: 1200,
+  });
 }
 
 async function clickInboxRowInMailTable(page, rowIndex, cellOrder = [1, 2]) {
-  const clicked = await page.evaluate(({ idx, cellOrder }) => {
-    const visible = element => {
-      if (!element) return false;
-      const style = window.getComputedStyle(element);
-      const rect = element.getBoundingClientRect();
-      return style.display !== 'none'
-        && style.visibility !== 'hidden'
-        && style.opacity !== '0'
-        && rect.width > 0
-        && rect.height > 0;
-    };
-    const tables = Array.from(document.querySelectorAll('table, .ant-table'));
-    const table = tables.find(item => {
-      const text = item.innerText || '';
-      return text.includes('发件人') && text.includes('送达时间');
-    });
-    if (!table) return false;
-    const rows = Array.from(table.querySelectorAll('tbody tr, .ant-table-tbody .ant-table-row'))
-      .filter(row => !row.classList.contains('ant-table-placeholder') && visible(row));
-    const row = rows[idx];
-    if (!row) return false;
-    const cells = row.querySelectorAll('td, .ant-table-cell');
-
-    let target = null;
-    for (const cellIndex of cellOrder) {
-      const cell = cells[cellIndex];
-      if (!cell) continue;
-      target = cell.querySelector('.cursor-pointer, .inbox-mail-receiving-tit, span, div') || cell;
-      if (target && visible(target)) break;
-    }
-    target = target || row;
-    target.scrollIntoView({ block: 'center', inline: 'nearest' });
-    const rect = target.getBoundingClientRect();
-    const options = {
-      bubbles: true,
-      cancelable: true,
-      view: window,
-      clientX: rect.left + rect.width / 2,
-      clientY: rect.top + rect.height / 2,
-    };
-    for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
-      target.dispatchEvent(new MouseEvent(type, options));
-    }
-    return true;
-  }, { idx: rowIndex, cellOrder }).catch(() => false);
-
-  if (clicked) await page.waitForTimeout(1500);
-  return clicked;
+  return await robustOpenMailRow(page, rowIndex, {
+    cellOrders: [cellOrder],
+    waitAfterMs: 1500,
+  });
 }
 
 async function waitForEmailDetail(page, row, timeout = 12000) {
-  return await page.waitForFunction((expected) => {
-    const normalize = value => String(value || '').replace(/\s+/g, ' ').trim();
-    const text = document.body?.innerText || '';
-    const hasDetailChrome = text.includes('邮件详情')
-      || text.includes('返回收件箱')
-      || Array.from(document.querySelectorAll('button, [role="button"], a')).some(element => {
-        const label = normalize(element.innerText || element.textContent || '');
-        return label === '回复' || label === '回复邮件';
-      });
-    const senderOk = !expected.sender || text.includes(expected.sender);
-    const subjectOk = !expected.subject || text.includes(String(expected.subject).slice(0, 20));
-    return hasDetailChrome && senderOk && subjectOk;
-  }, row, { timeout }).then(() => true).catch(() => false);
+  return await waitForMailDetail(page, row, { timeout });
 }
 
 async function openInboxResult(page, row) {
@@ -514,11 +376,8 @@ async function openInboxResult(page, row) {
     if (detailReady) return true;
   }
 
-  const preview = await page.evaluate(() => ({
-    url: window.location.href,
-    text: (document.body?.innerText || '').slice(0, 700),
-  })).catch(error => ({ url: '', text: error.message }));
-  throw new Error(`email detail did not open; row=${row.rowIndex}; sender=${row.sender || ''}; subject=${row.subject || ''}; url=${preview.url}; text=${preview.text}`);
+  const failure = await captureDomFailure(page, 'email-detail-open-failed', { row });
+  throw new Error(`email detail did not open; row=${row.rowIndex}; sender=${row.sender || ''}; subject=${row.subject || ''}; ${summarizeDomFailure(failure)}`);
 }
 
 async function reopenInboxResult(page, row, pageIndex = 1) {

@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 const { launchProBoostSession, persistAuthSnapshot } = require('./session');
 const {
   searchInboxByHandle,
@@ -14,8 +15,13 @@ const {
 } = require('./mailClient');
 const { listUnusedInvites } = require('../importer/queries');
 const { getActiveTemplate, renderTemplate } = require('../templates/render');
-const { insertSendLog } = require('../db');
-const { classifyInboxReply } = require('../classifier/inboxRules');
+const {
+  insertSendLog,
+  upsertMailThread,
+  insertMailMessage,
+  insertAnalysisResult,
+} = require('../db');
+const { classifyInboxReplyWithOptionalLlm } = require('../classifier/llmClassifier');
 const config = require('../config');
 
 function parseHandles(value) {
@@ -77,6 +83,77 @@ function renderFollowup(template, variables) {
   if (!template) return null;
   const rendered = renderTemplate(template, variables);
   return rendered.ok ? rendered : null;
+}
+
+function stableHash(parts) {
+  return crypto
+    .createHash('sha256')
+    .update(parts.map(item => String(item || '').trim()).join('\n'))
+    .digest('hex')
+    .slice(0, 32);
+}
+
+function deriveThreadKey({ page, row, threadText }) {
+  const currentUrl = page?.url?.() || '';
+  try {
+    const parsed = new URL(currentUrl);
+    const stableKeys = ['threadId', 'thread_id', 'mailId', 'mail_id', 'messageId', 'message_id', 'id'];
+    for (const key of stableKeys) {
+      const value = parsed.searchParams.get(key);
+      if (value) return `url:${parsed.origin}${parsed.pathname}?${key}=${value}`;
+    }
+    if (parsed.hash && /id|thread|mail|message/i.test(parsed.hash)) {
+      return `url:${parsed.origin}${parsed.pathname}${parsed.hash}`;
+    }
+  } catch {
+    // Fall through to deterministic row/thread hashes.
+  }
+
+  if (row?.sender || row?.subject || row?.time) {
+    return `row:${stableHash([row.sender, row.subject, row.time])}`;
+  }
+  return `text:${stableHash([row?.sender, row?.subject, String(threadText || '').slice(0, 500)])}`;
+}
+
+function persistThreadRead(db, { page, row, threadText }) {
+  const providerThreadId = deriveThreadKey({ page, row, threadText });
+  const now = new Date().toISOString();
+  const threadRecord = upsertMailThread(db, {
+    provider_thread_id: providerThreadId,
+    mailbox: 'inbox',
+    sender: row.sender,
+    subject: row.subject,
+    first_message_at: row.time,
+    last_message_at: now,
+    last_synced_at: now,
+  });
+  const messageRecord = insertMailMessage(db, {
+    thread_id: threadRecord.id,
+    direction: 'inbound',
+    subject: row.subject,
+    sender: row.sender,
+    body_text: threadText,
+    received_at: row.time,
+  });
+  return { threadRecord, messageRecord, providerThreadId };
+}
+
+function persistClassification(db, { messageRecord, classification }) {
+  if (!messageRecord || !classification) return null;
+  return insertAnalysisResult(db, {
+    message_id: messageRecord.id,
+    intent: classification.intent,
+    confidence: classification.confidence,
+    needs_invite_code: classification.inviteCodes?.length === 0,
+    has_contact: Boolean(classification.hasPhone),
+    contact_type: classification.hasPhone ? 'phone' : null,
+    contact_value: classification.phoneNumbers?.[0] || null,
+    recommended_action: classification.recommendedAction,
+    reason: classification.reason,
+    model: classification.source || 'rules',
+    prompt_version: 'inbox-rules-v1',
+    raw_json: classification,
+  });
 }
 
 function summarizeReadyFollowupRun({ runId, dryRun, maxPages, results, pageIndex = 1, scannedRows = 0, note = '' }) {
@@ -306,6 +383,9 @@ async function runReadyFollowupBatch(db, options) {
         let status = 'failed';
         let errorMessage = '';
         let classification = null;
+        let threadRecord = null;
+        let messageRecord = null;
+        let analysisRecord = null;
         let templateName = null;
         let rendered = null;
         const resultItem = {
@@ -320,6 +400,9 @@ async function runReadyFollowupBatch(db, options) {
           classification: null,
           opened: false,
           threadChars: 0,
+          threadId: null,
+          messageId: null,
+          analysisId: null,
         };
         results.push(resultItem);
         await emitReadyFollowupProgress(options, summarizeReadyFollowupRun({
@@ -361,6 +444,13 @@ async function runReadyFollowupBatch(db, options) {
 
           const threadText = await extractOpenedThreadText(page);
           resultItem.threadChars = threadText.length;
+          ({ threadRecord, messageRecord } = persistThreadRead(db, {
+            page,
+            row,
+            threadText,
+          }));
+          resultItem.threadId = threadRecord.id;
+          resultItem.messageId = messageRecord.id;
           resultItem.stage = 'thread-read';
           await emitReadyFollowupProgress(options, summarizeReadyFollowupRun({
             runId,
@@ -372,13 +462,15 @@ async function runReadyFollowupBatch(db, options) {
             note: 'thread-read',
           }));
 
-          classification = classifyInboxReply({
+          classification = await classifyInboxReplyWithOptionalLlm({
             row,
             threadText,
             registeredNames,
             readyKeywords,
           });
           resultItem.classification = classification;
+          analysisRecord = persistClassification(db, { messageRecord, classification });
+          resultItem.analysisId = analysisRecord?.id || null;
           resultItem.stage = 'classified';
           await emitReadyFollowupProgress(options, summarizeReadyFollowupRun({
             runId,
@@ -390,7 +482,7 @@ async function runReadyFollowupBatch(db, options) {
             note: 'classified',
           }));
 
-          if (classification.recommendedAction === 'ignore' || classification.recommendedAction === 'skip_registered') {
+          if (['ignore', 'skip_registered', 'manual_review'].includes(classification.recommendedAction)) {
             status = classification.recommendedAction;
           } else {
             const inviteCode = classification.inviteCodes[0] || '';

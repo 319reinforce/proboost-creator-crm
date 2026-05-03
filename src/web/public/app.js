@@ -7,6 +7,11 @@
     "'": '&#39;',
   }[char]));
 
+  const rowKey = (...parts) => parts
+    .map(part => String(part ?? '').trim())
+    .filter(Boolean)
+    .join('|') || `row-${Math.random().toString(16).slice(2)}`;
+
   const actionLabel = action => ({
     send_whatsapp_followup: '有联系方式，发 WhatsApp 跟进模板',
     send_register_followup: '无联系方式，发注册提醒模板',
@@ -21,12 +26,61 @@
     return '';
   };
 
-  function renderResultRows(rows) {
-    const tbody = document.getElementById('followup-result-rows');
+  function updateTableContent(tbodyId, rowsData, renderRow) {
+    const tbody = document.getElementById(tbodyId);
     if (!tbody) return;
-    tbody.innerHTML = rows.map(item => {
+
+    const temp = document.createElement('tbody');
+    temp.innerHTML = rowsData.map(renderRow).join('');
+
+    const existingRows = Array.from(tbody.children);
+    const newRows = Array.from(temp.children);
+    const keyedRows = new Map();
+    const consumed = new Set();
+
+    existingRows.forEach((row, index) => {
+      if (!row.dataset.rowKey) row.dataset.rowKey = `${tbodyId}:index:${index}`;
+      keyedRows.set(row.dataset.rowKey, row);
+    });
+
+    newRows.forEach((newRow, i) => {
+      if (!newRow.dataset.rowKey) newRow.dataset.rowKey = `${tbodyId}:index:${i}`;
+      let currentRow = keyedRows.get(newRow.dataset.rowKey);
+
+      if (!currentRow && existingRows[i] && !consumed.has(existingRows[i])) {
+        currentRow = existingRows[i];
+      }
+
+      if (currentRow) {
+        const openDetails = currentRow.querySelector('details[open]') !== null;
+        if (currentRow.innerHTML !== newRow.innerHTML || currentRow.className !== newRow.className) {
+          currentRow.innerHTML = newRow.innerHTML;
+          currentRow.className = newRow.className;
+          currentRow.dataset.rowKey = newRow.dataset.rowKey;
+          if (openDetails) currentRow.querySelector('details')?.setAttribute('open', '');
+          currentRow.style.animation = 'none';
+          currentRow.offsetHeight; /* trigger reflow */
+          currentRow.style.animation = 'highlightUpdate 900ms ease-out';
+        }
+        consumed.add(currentRow);
+        const reference = tbody.children[i];
+        if (reference !== currentRow) tbody.insertBefore(currentRow, reference || null);
+      } else {
+        newRow.style.animation = 'highlightNew 420ms ease-out';
+        tbody.insertBefore(newRow, tbody.children[i] || null);
+        consumed.add(newRow);
+      }
+    });
+
+    Array.from(tbody.children).forEach(row => {
+      if (!consumed.has(row)) row.remove();
+    });
+  }
+
+  function renderResultRows(rows) {
+    updateTableContent('followup-result-rows', rows, item => {
       const classification = item.classification || {};
-      return `<tr>
+      return `<tr data-row-key="${escapeHtml(rowKey(item.sender, item.subject, item.stage, item.template, classification.recommendedAction))}">
         <td>${escapeHtml(item.sender || '-')}</td>
         <td>${escapeHtml(item.subject || '-')}</td>
         <td><span class="status ${escapeHtml(statusClass(item.status))}">${escapeHtml(classification.intent || item.status || '-')}</span></td>
@@ -38,19 +92,26 @@
         <td>${escapeHtml(item.threadChars || 0)}</td>
         <td>${escapeHtml(item.error || '-')}</td>
       </tr>`;
-    }).join('');
+    });
   }
 
   function renderTaskRows(tasks) {
-    const tbody = document.getElementById('followup-task-rows');
-    if (!tbody) return;
-    tbody.innerHTML = tasks.map(job => `<tr>
+    updateTableContent('followup-task-rows', tasks, job => `<tr data-row-key="${escapeHtml(rowKey(job.id, job.startedAt, job.templateName))}">
       <td>${escapeHtml(job.startedAt || '-')}</td>
       <td><span class="status ${escapeHtml(statusClass(job.status))}">${escapeHtml(job.status || '-')}</span></td>
       <td>${escapeHtml(job.templateName || '-')}</td>
       <td>${escapeHtml(job.finishedAt || '-')}</td>
       <td>${job.error ? `<details><summary>错误</summary><pre>${escapeHtml(job.error)}</pre></details>` : escapeHtml(job.runId || '-')}</td>
-    </tr>`).join('');
+    </tr>`);
+  }
+
+  function setMetricValue(el, value) {
+    const next = String(value || 0);
+    if (el.textContent === next) return;
+    el.textContent = next;
+    el.classList.remove('is-number-updated');
+    el.offsetHeight; /* trigger reflow */
+    el.classList.add('is-number-updated');
   }
 
   async function refreshFollowup() {
@@ -62,7 +123,7 @@
 
     for (const key of ['scannedRows', 'processed', 'opened', 'threadRead', 'openFailed', 'readyCount', 'whatsappFollowups', 'registerFollowups', 'skippedRegistered']) {
       const el = document.querySelector(`[data-followup-metric="${key}"]`);
-      if (el) el.textContent = String(result[key] || 0);
+      if (el) setMetricValue(el, result[key]);
     }
 
     const latest = payload.latest || {};
@@ -79,7 +140,16 @@
     renderTaskRows(payload.tasks || []);
   }
 
+  document.addEventListener('submit', event => {
+    const form = event.target;
+    if (!(form instanceof HTMLFormElement)) return;
+    const submitter = event.submitter || form.querySelector('button[type="submit"], button:not([type])');
+    form.setAttribute('aria-busy', 'true');
+    submitter?.classList.add('is-submitting');
+  });
+
   if (!window.EventSource) return;
+
   const events = new EventSource('/events');
   events.addEventListener('job', event => {
     try {

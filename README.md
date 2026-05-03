@@ -2,6 +2,9 @@
 
 `proboost-creator-crm` is the next-stage CRM project for ProBoost creator operations.
 
+Agent handoff rule: future coding agents must read `docs/agent-git-workflow.md` before editing. Use GitHub as the remote and create a new working branch before every code change. For followup automation work, also read `docs/followup-optimization-plan.md`.
+For send-mail batch-state migration work, read `docs/send-mail-sqlite-migration-plan.md`.
+
 It turns one-off reminder scripts into a structured workflow:
 
 1. Import pushed invite-code lists.
@@ -167,3 +170,4 @@ Notes:
 - Sent-mail data is not copied into CRM storage.
 - The ProBoost sent-mail page is only used by the underlying browser workflow when verification is explicitly enabled.
 - Batch status is stored only in each generated `manifest.json`.
+- Migration away from manifest-owned batch state is planned in `docs/send-mail-sqlite-migration-plan.md`; Phase 1 mirrors split/run state into SQLite while preserving the legacy workflow.

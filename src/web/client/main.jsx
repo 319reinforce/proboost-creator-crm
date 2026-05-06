@@ -5,7 +5,10 @@ import {
   AlertTriangle,
   BarChart3,
   CheckCircle2,
+  ChevronLeft,
+  ChevronRight,
   Database,
+  FileText,
   Mail,
   RefreshCw,
   Send,
@@ -164,6 +167,185 @@ function DataTable({ rows }) {
           ))}
         </tbody>
       </table>
+    </div>
+  );
+}
+
+function BatchTable({ batches }) {
+  if (!batches.length) return <p className="empty-text">这个工单还没有批次记录。</p>;
+  return (
+    <div className="table-shell">
+      <table className="modern-table batch-table">
+        <thead>
+          <tr>
+            <th>批次</th>
+            <th>文件</th>
+            <th>行数</th>
+            <th>已选</th>
+            <th>状态</th>
+            <th>原因</th>
+            <th>心跳</th>
+          </tr>
+        </thead>
+        <tbody>
+          {batches.map(batch => (
+            <tr key={batch.id || batch.batchNumber}>
+              <td>{batch.batchNumber}</td>
+              <td>{batch.fileName || '-'}</td>
+              <td>{formatNumber(batch.rowCount)}</td>
+              <td>{batch.selectedCount == null ? '-' : formatNumber(batch.selectedCount)}</td>
+              <td><StatusPill status={batch.status}>{batch.label || statusLabel(batch.status)}</StatusPill></td>
+              <td>{batch.reason || '-'}</td>
+              <td>{batch.lastHeartbeatAt || '-'}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function WorkOrderCard({ order }) {
+  const summary = order.summary || {};
+  const hasActiveJob = (order.activeJobs || []).length > 0;
+
+  return (
+    <section className="dashboard-band work-order-card">
+      <div className="work-order-head">
+        <div>
+          <div className="work-order-title">
+            <FileText size={18} />
+            <h3>{order.campaignName}</h3>
+            <StatusPill status={hasActiveJob ? 'running' : order.status}>{hasActiveJob ? '运行中' : statusLabel(order.status)}</StatusPill>
+          </div>
+          <div className="work-order-paths">
+            <span>源文件：{order.sourceFile || '-'}</span>
+            <span>Legacy manifest：{order.manifestPath || '-'}</span>
+          </div>
+        </div>
+        <form className="send-form" method="post" action="/batch/send-pending">
+          <input type="hidden" name="manifestPath" value={order.rawManifestPath || ''} />
+          <label>
+            <span>模板</span>
+            <input name="templateName" list="template-options" defaultValue="0414新规模板" />
+          </label>
+          <button className="refresh-button danger-action" type="submit" disabled={!order.rawManifestPath || hasActiveJob}>
+            <Send size={16} />
+            创建发送工单
+          </button>
+        </form>
+      </div>
+
+      <div className="work-order-metrics">
+        <div><strong>{formatNumber(summary.total)}</strong><span>批次</span></div>
+        <div><strong>{formatNumber(summary.totalRows)}</strong><span>行</span></div>
+        <div><strong>{formatNumber(summary.pending)}</strong><span>待发送</span></div>
+        <div><strong>{formatNumber(summary.sent)}</strong><span>已发送</span></div>
+        <div><strong>{formatNumber(summary.confirmedButUnverified)}</strong><span>待复核</span></div>
+        <div><strong>{formatNumber(summary.selected)}</strong><span>已选达人</span></div>
+      </div>
+
+      {order.latestLog ? (
+        <details className="work-order-log">
+          <summary>最近进程：<a href={order.latestLog.href}>{order.latestLog.name}</a></summary>
+          <pre>{order.latestLog.summary}</pre>
+        </details>
+      ) : (
+        <p className="empty-text">还没有发送进程日志。</p>
+      )}
+
+      <details className="batch-details">
+        <summary>查看批次明细</summary>
+        <BatchTable batches={order.batches || []} />
+      </details>
+    </section>
+  );
+}
+
+function SendApp({ initialPage = 1 }) {
+  const [payload, setPayload] = useState(null);
+  const [page, setPage] = useState(Number(initialPage || 1));
+  const [error, setError] = useState('');
+  const [loading, setLoading] = useState(true);
+
+  async function load(nextPage = page) {
+    setLoading(true);
+    setError('');
+    try {
+      const nextPayload = await fetchJson(`/api/send-work-orders?page=${nextPage}`);
+      setPayload(nextPayload);
+      setPage(nextPayload.page || nextPage);
+    } catch (err) {
+      setError(err.message || String(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    load(page);
+    if (!window.EventSource) return undefined;
+    const events = new EventSource('/events');
+    events.addEventListener('job', () => load(page));
+    return () => events.close();
+  }, [page]);
+
+  const summary = payload?.summary || {};
+  const workOrders = payload?.workOrders || [];
+  const canPrev = Number(payload?.page || page) > 1;
+  const canNext = Number(payload?.page || page) < Number(payload?.totalPages || 1);
+
+  return (
+    <div className="crm-app send-app">
+      <div className="dashboard-head">
+        <div>
+          <p className="eyebrow">Send Mail Operations</p>
+          <h2>发信工单</h2>
+        </div>
+        <button className="refresh-button" type="button" onClick={() => load(page)} disabled={loading}>
+          <RefreshCw size={16} className={loading ? 'spin' : ''} />
+          刷新
+        </button>
+      </div>
+
+      {error ? (
+        <div className="notice error">
+          <AlertTriangle size={18} />
+          {error}
+        </div>
+      ) : null}
+
+      <section className="dashboard-band summary-band">
+        <div className="stat-grid send-stat-grid">
+          <StatCard icon={Mail} label="工单" value={summary.workOrders} caption="SQLite send_mail_campaigns" />
+          <StatCard icon={Database} label="批次" value={summary.batches} tone="violet" caption={`${formatNumber(summary.rows)} 达人行数`} />
+          <StatCard icon={Send} label="待发送" value={summary.pending} caption="可创建发送工单" />
+          <StatCard icon={CheckCircle2} label="已发送" value={summary.sent} tone="green" caption={`${formatNumber(summary.selected)} 已选达人`} />
+          <StatCard icon={AlertTriangle} label="需处理" value={(summary.failed || 0) + (summary.unverified || 0)} tone="red" caption="失败 / 待复核" />
+        </div>
+      </section>
+
+      {loading && !payload ? <p className="empty-text">正在加载发信工单...</p> : null}
+      {!loading && !workOrders.length ? (
+        <section className="dashboard-band empty-panel">
+          <p className="empty-text">还没有 SQLite 发信工单。上传并拆分 xlsx 后，这里会显示批次状态。</p>
+        </section>
+      ) : null}
+      {workOrders.map(order => <WorkOrderCard key={order.id} order={order} />)}
+
+      {payload && payload.totalItems > payload.pageSize ? (
+        <nav className="send-pagination" aria-label="工单分页">
+          <button type="button" onClick={() => setPage(page - 1)} disabled={!canPrev}>
+            <ChevronLeft size={16} />
+            上一页
+          </button>
+          <span>第 {formatNumber(payload.page)} / {formatNumber(payload.totalPages)} 页，共 {formatNumber(payload.totalItems)} 个工单</span>
+          <button type="button" onClick={() => setPage(page + 1)} disabled={!canNext}>
+            下一页
+            <ChevronRight size={16} />
+          </button>
+        </nav>
+      ) : null}
     </div>
   );
 }
@@ -403,4 +585,9 @@ function DashboardApp() {
 const root = document.getElementById('dashboard-root');
 if (root) {
   createRoot(root).render(<DashboardApp />);
+}
+
+const sendRoot = document.getElementById('send-root');
+if (sendRoot) {
+  createRoot(sendRoot).render(<SendApp initialPage={sendRoot.dataset.page || 1} />);
 }

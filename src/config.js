@@ -11,7 +11,6 @@ function boolEnv(name, fallback = false) {
 const rootDir = path.resolve(__dirname, '..');
 const sharedAuthRoots = [
   '/Users/depp/proboost-ready-reminder/.proboost-reply-auth',
-  '/Users/depp/send-mail/.proboost-auth',
 ];
 const auth = resolveAuthConfig({ baseDir: rootDir, appName: 'proboost-creator-crm' });
 const sharedAuthRoot = sharedAuthRoots.find(item => fs.existsSync(item));

@@ -291,6 +291,118 @@ function summarizeManifest(manifest) {
   };
 }
 
+function summarizeSendMailBatchRows(rows) {
+  const counts = rows.reduce((acc, batch) => {
+    const status = batch.status || 'pending';
+    acc[status] = (acc[status] || 0) + 1;
+    if (batch.reason === 'success-toast-not-found') acc.confirmedButUnverified += 1;
+    if (Number(batch.selected_count || 0) > 0) acc.selected += Number(batch.selected_count || 0);
+    return acc;
+  }, { pending: 0, sent: 0, failed: 0, sending: 0, prepared: 0, preparing: 0, confirmedButUnverified: 0, selected: 0 });
+  return {
+    total: rows.length,
+    totalRows: rows.reduce((sum, batch) => sum + Number(batch.row_count || 0), 0),
+    ...counts,
+  };
+}
+
+function sendMailSummaryFromSqlite() {
+  const campaignCount = webDb.prepare('SELECT COUNT(*) AS count FROM send_mail_campaigns').get();
+  const row = webDb.prepare(`
+    SELECT
+      COUNT(*) AS batches,
+      COALESCE(SUM(row_count), 0) AS rows,
+      COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0) AS pending,
+      COALESCE(SUM(CASE WHEN status = 'sent' THEN 1 ELSE 0 END), 0) AS sent,
+      COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS failed,
+      COALESCE(SUM(CASE WHEN status = 'prepared' THEN 1 ELSE 0 END), 0) AS prepared,
+      COALESCE(SUM(CASE WHEN status IN ('sending', 'preparing') THEN 1 ELSE 0 END), 0) AS sending,
+      COALESCE(SUM(CASE WHEN reason = 'success-toast-not-found' THEN 1 ELSE 0 END), 0) AS unverified,
+      COALESCE(SUM(COALESCE(selected_count, 0)), 0) AS selected
+    FROM send_mail_batches
+  `).get();
+  return {
+    workOrders: Number(campaignCount?.count || 0),
+    batches: Number(row?.batches || 0),
+    rows: Number(row?.rows || 0),
+    pending: Number(row?.pending || 0),
+    sent: Number(row?.sent || 0),
+    failed: Number(row?.failed || 0),
+    prepared: Number(row?.prepared || 0),
+    sending: Number(row?.sending || 0),
+    unverified: Number(row?.unverified || 0),
+    selected: Number(row?.selected || 0),
+  };
+}
+
+function sendWorkOrdersPayload(pageNumber = 1) {
+  const pageSize = 2;
+  const totalRow = webDb.prepare('SELECT COUNT(*) AS count FROM send_mail_campaigns').get();
+  const totalItems = Number(totalRow?.count || 0);
+  const totalPages = Math.max(Math.ceil(totalItems / pageSize), 1);
+  const currentPage = clampPage(pageNumber, totalPages);
+  const campaigns = webDb.prepare(`
+    SELECT *
+    FROM send_mail_campaigns
+    ORDER BY updated_at DESC, id DESC
+    LIMIT ? OFFSET ?
+  `).all(pageSize, (currentPage - 1) * pageSize);
+  const batchesForCampaign = webDb.prepare(`
+    SELECT *
+    FROM send_mail_batches
+    WHERE send_mail_campaign_id = ?
+    ORDER BY batch_number ASC
+  `);
+  const jobs = recentTaskRuns(null, 50);
+  const workOrders = campaigns.map(campaign => {
+    const batches = batchesForCampaign.all(campaign.id);
+    const summary = summarizeSendMailBatchRows(batches);
+    const active = jobs.filter(job => job.manifestPath === campaign.manifest_path && job.status === 'running');
+    const latestLog = findLatestLog(campaign.name);
+    return {
+      id: campaign.id,
+      campaignName: fixMojibake(campaign.name),
+      sourceFile: displayPath(campaign.input_file || campaign.original_upload || ''),
+      manifestPath: displayPath(campaign.manifest_path || ''),
+      rawManifestPath: campaign.manifest_path || '',
+      status: campaign.status || 'pending',
+      summary,
+      activeJobs: active.map(job => ({
+        id: job.id,
+        type: job.type,
+        status: job.status,
+        startedAt: job.startedAt,
+      })),
+      latestLog: latestLog ? {
+        name: fixMojibake(latestLog.name),
+        href: `/logs/${encodeURIComponent(latestLog.name)}`,
+        summary: summarizeLog(latestLog.filePath),
+      } : null,
+      batches: batches.map(batch => ({
+        id: batch.id,
+        batchNumber: batch.batch_number,
+        fileName: path.basename(fixMojibake(batch.file_path || '')),
+        rowCount: batch.row_count || 0,
+        selectedCount: batch.selected_count,
+        status: batch.status || 'pending',
+        label: statusLabel(batch),
+        reason: batch.reason || '',
+        attemptCount: batch.attempt_count || 0,
+        claimedBy: batch.claimed_by || '',
+        lastHeartbeatAt: batch.last_heartbeat_at || '',
+      })),
+    };
+  });
+  return {
+    page: currentPage,
+    pageSize,
+    totalItems,
+    totalPages,
+    summary: sendMailSummaryFromSqlite(),
+    workOrders,
+  };
+}
+
 function statusLabel(batch) {
   const status = batch.status || 'pending';
   if (batch.reason === 'success-toast-not-found') return '已确认待复核';
@@ -532,6 +644,39 @@ function renderInboxClassification() {
 }
 
 function renderSendPage(pageNumber) {
+  const dashboardBundle = path.join(__dirname, 'public', 'app', 'assets', 'main.js');
+  if (fs.existsSync(dashboardBundle)) {
+    return `
+      <section>
+        <h2>上传并拆分 xlsx</h2>
+        <datalist id="template-options">
+          <option value="0414新规模板"></option>
+          <option value="0421三图模板"></option>
+        </datalist>
+        <form method="post" action="/upload" enctype="multipart/form-data">
+          <div class="grid">
+            <div>
+              <label>本地 xlsx 文件，可多选</label>
+              <input name="files" type="file" accept=".xlsx" multiple required />
+            </div>
+            <div>
+              <label>每批人数</label>
+              <input name="batchSize" type="number" min="1" value="200" />
+            </div>
+            <div>
+              <label>任务名前缀</label>
+              <input name="campaignPrefix" value="proboost" />
+            </div>
+          </div>
+          <p class="muted">上传后只生成批次和 manifest；不会发送。发送动作需要在下方逐批点击。</p>
+          <button type="submit">上传拆分</button>
+        </form>
+      </section>
+      <link rel="stylesheet" href="/app/assets/main.css" />
+      <div id="send-root" data-page="${escapeHtml(pageNumber || 1)}"></div>
+      <script type="module" src="/app/assets/main.js"></script>
+    `;
+  }
   return `
     <section>
       <h2>上传并拆分 xlsx</h2>
@@ -577,23 +722,7 @@ function renderDashboard() {
 }
 
 function dashboardPayload() {
-  const manifests = listManifestPaths(batchesDir)
-    .map(manifestPath => readManifest(manifestPath))
-    .filter(Boolean);
-  const sendSummary = manifests.reduce((acc, manifest) => {
-    const summary = summarizeManifest(manifest);
-    acc.workOrders += 1;
-    acc.batches += summary.total;
-    acc.rows += summary.totalRows;
-    acc.pending += summary.pending;
-    acc.sent += summary.sent;
-    acc.failed += summary.failed;
-    acc.prepared += summary.prepared;
-    acc.sending += summary.sending + summary.preparing;
-    acc.unverified += summary.confirmedButUnverified;
-    acc.selected += summary.selected;
-    return acc;
-  }, { workOrders: 0, batches: 0, rows: 0, pending: 0, sent: 0, failed: 0, prepared: 0, sending: 0, unverified: 0, selected: 0 });
+  const sendSummary = sendMailSummaryFromSqlite();
   const bridgeRows = webDb.prepare(`
     SELECT status, COUNT(*) AS count
     FROM send_logs
@@ -715,6 +844,11 @@ app.get('/api/followup-summary', (_req, res) => {
 
 app.get('/api/dashboard', (_req, res) => {
   res.json(dashboardPayload());
+});
+
+app.get('/api/send-work-orders', (req, res) => {
+  const pageNumber = Number.parseInt(req.query.page || '1', 10);
+  res.json(sendWorkOrdersPayload(pageNumber));
 });
 
 app.get('/send', (req, res) => {

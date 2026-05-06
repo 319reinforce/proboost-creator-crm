@@ -47,19 +47,32 @@ The target is:
   - nonzero runner failure release
   - stale `sending/preparing` recovery on web startup and every minute
 
+- Phase 4: runtime SQLite adapter
+  - project-owned runtime bridge updates `send_mail_batches` directly
+  - terminal runtime status updates clear claims in SQLite
+  - compatibility manifest writes remain only for current runner inputs
+
+- Phase 5: manifest retired from CRM-owned surfaces
+  - dashboard and `/send` read SQLite-backed JSON APIs
+  - manifest paths are legacy/debug metadata and runner compatibility inputs
+
+- Phase 6: production split/send entrypoints internalized
+  - split logic lives in `src/sendMailBridge/splitCreators.js`
+  - send runtime lives in `src/sendMailBridge/runtime/`
+  - production code no longer uses `SEND_MAIL_ROOT` or `/Users/depp/send-mail`
+
 ### In Progress
 
-- Phase 2 frontend modernization
-  - React/Vite/Tailwind dashboard skeleton exists in `src/web/client/`
-  - `/api/dashboard` exists
-  - `/dashboard` has a fallback if the frontend bundle is not built
-  - `npm install` was blocked by sandbox network, so dependencies and `package-lock.json` may need attention before build verification
+- Phase 2 frontend modernization hardening
+  - React/Vite/Tailwind dashboard and `/send` app exist in `src/web/client/`
+  - `/api/dashboard` and `/api/send-work-orders` exist
+  - `/dashboard` and `/send` load `/app/assets/main.js` when the frontend bundle is built
 
 ### Not Yet Done
 
-- Phase 4: runtime bridge that lets legacy automation update SQLite directly
-- Phase 5: manifest retirement
-- Phase 6: internalize `/Users/depp/send-mail` split/send logic into this repo
+- Remove the compatibility `MANIFEST_PATH` contract from the send runner internals.
+- Convert the runtime send flow from environment-variable configuration to direct typed task options.
+- Add deeper smoke coverage for headed Playwright sending in a non-production dry-run profile.
 
 ## Current Important Files
 
@@ -71,6 +84,9 @@ Send-mail state migration:
 - `src/sendMailBridge/engine.js`
 - `src/sendMailBridge/syncToCrm.js`
 - `src/sendMailBridge/runtimeScript.js`
+- `src/sendMailBridge/runtimeSqliteBridge.js`
+- `src/sendMailBridge/splitCreators.js`
+- `src/sendMailBridge/runtime/`
 
 Web frontend migration:
 
@@ -96,9 +112,9 @@ Do not modify these external projects directly unless the user explicitly asks:
 - `/Users/depp/send-mail`
 - `/Users/depp/proboost-ready-reminder`
 
-Treat them as read-only execution engines and reference implementations. New behavior, state interpretation, status mapping, preflight checks, logs, reports, and UI should live in this repo.
+Treat them as read-only reference implementations. Production split/send entrypoints now live in this repo.
 
-The long-term goal is Phase 6: move the relevant split and Playwright send logic into this repo so the CRM is clone-and-run.
+The remaining long-term goal is to remove the compatibility manifest/env-var contract inside the project-owned runtime.
 
 ## Known Verification Gaps
 

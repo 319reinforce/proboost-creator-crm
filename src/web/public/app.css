@@ -6,19 +6,19 @@
   --font-mono: "SFMono-Regular", "Cascadia Code", "JetBrains Mono", Consolas, monospace;
   --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
   --ease-fast: cubic-bezier(0.25, 1, 0.5, 1);
-  --page: oklch(96% 0.018 84);
-  --page-soft: oklch(93% 0.022 92);
-  --surface: oklch(99% 0.008 86);
-  --surface-raised: oklch(100% 0.006 86);
-  --surface-tint: oklch(96% 0.016 118);
-  --ink: oklch(23% 0.028 248);
-  --ink-soft: oklch(38% 0.026 248);
-  --muted: oklch(54% 0.024 248);
-  --line: oklch(86% 0.022 94);
-  --line-strong: oklch(76% 0.03 96);
-  --accent: oklch(52% 0.13 205);
-  --accent-deep: oklch(42% 0.13 210);
-  --accent-soft: oklch(91% 0.05 203);
+  --page: oklch(97% 0.01 255);
+  --page-soft: oklch(94% 0.015 255);
+  --surface: oklch(100% 0 0);
+  --surface-raised: oklch(100% 0 0);
+  --surface-tint: oklch(97% 0.015 255);
+  --ink: oklch(20% 0.02 255);
+  --ink-soft: oklch(40% 0.02 255);
+  --muted: oklch(55% 0.015 255);
+  --line: oklch(90% 0.01 255);
+  --line-strong: oklch(80% 0.015 255);
+  --accent: oklch(58% 0.15 255);
+  --accent-deep: oklch(45% 0.15 255);
+  --accent-soft: oklch(94% 0.05 255);
   --danger: oklch(56% 0.18 29);
   --danger-soft: oklch(93% 0.055 31);
   --success: oklch(55% 0.13 151);
@@ -35,19 +35,19 @@
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --page: oklch(19% 0.022 248);
-    --page-soft: oklch(15% 0.024 248);
-    --surface: oklch(24% 0.024 248);
-    --surface-raised: oklch(28% 0.026 248);
-    --surface-tint: oklch(30% 0.034 214);
-    --ink: oklch(91% 0.016 92);
-    --ink-soft: oklch(78% 0.018 92);
-    --muted: oklch(68% 0.02 92);
-    --line: oklch(36% 0.028 248);
-    --line-strong: oklch(46% 0.032 248);
-    --accent: oklch(70% 0.12 200);
-    --accent-deep: oklch(78% 0.09 196);
-    --accent-soft: oklch(34% 0.06 206);
+    --page: oklch(16% 0.015 255);
+    --page-soft: oklch(14% 0.015 255);
+    --surface: oklch(20% 0.02 255);
+    --surface-raised: oklch(24% 0.02 255);
+    --surface-tint: oklch(24% 0.03 255);
+    --ink: oklch(95% 0.01 255);
+    --ink-soft: oklch(80% 0.015 255);
+    --muted: oklch(65% 0.015 255);
+    --line: oklch(30% 0.02 255);
+    --line-strong: oklch(40% 0.02 255);
+    --accent: oklch(70% 0.15 255);
+    --accent-deep: oklch(80% 0.12 255);
+    --accent-soft: oklch(30% 0.08 255);
     --danger: oklch(71% 0.15 29);
     --danger-soft: oklch(34% 0.072 31);
     --success: oklch(72% 0.13 151);
@@ -178,7 +178,7 @@ h1 {
   padding: 4px;
   border: 1px solid var(--line);
   border-radius: var(--radius);
-  background: oklch(100% 0.006 86 / 68%);
+  background: color-mix(in oklch, var(--surface-raised) 68%, transparent);
   box-shadow: var(--shadow-sm);
 }
 
@@ -190,7 +190,7 @@ h1 {
   justify-content: center;
   padding: 0 15px;
   border-radius: 6px;
-  color: var(--ink-soft);
+  color: var(--muted);
   font-size: 14px;
   font-weight: 760;
   text-decoration: none;
@@ -198,19 +198,19 @@ h1 {
   transition:
     color 180ms var(--ease-fast),
     background-color 180ms var(--ease-fast),
-    transform 180ms var(--ease-fast);
+    transform 180ms var(--ease-fast),
+    box-shadow 180ms var(--ease-fast);
 }
 
 .tab:hover {
-  color: var(--accent-deep);
-  background: var(--accent-soft);
-  transform: translateY(-1px);
+  color: var(--ink);
+  background: color-mix(in oklch, var(--surface-tint) 50%, transparent);
 }
 
 .tab.is-active {
-  color: oklch(98% 0.01 86);
-  background: var(--accent-deep);
-  box-shadow: 0 10px 22px oklch(42% 0.13 210 / 20%);
+  color: var(--ink);
+  background: var(--surface);
+  box-shadow: var(--shadow-sm);
 }
 
 .utility-nav {

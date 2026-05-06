@@ -1,16 +1,83 @@
 const fs = require('fs');
 const path = require('path');
 const config = require('../config');
-const { SEND_MAIL_ROOT } = require('./paths');
 
-const runtimeRoot = path.join(config.rootDir, '.send-mail-runtime');
+const ownedRuntimeRoot = path.join(__dirname, 'runtime');
+const ownedAutoScript = path.join(ownedRuntimeRoot, 'proboost-auto.js');
 
-function copyRuntimeDependency(fileName) {
-  const source = path.join(SEND_MAIL_ROOT, fileName);
-  const target = path.join(runtimeRoot, fileName);
-  if (fs.existsSync(source)) {
-    fs.copyFileSync(source, target);
+function writeRuntimeSqliteBridge() {
+  const source = path.join(__dirname, 'runtimeSqliteBridge.js');
+  const target = path.join(ownedRuntimeRoot, 'runtime-sqlite-bridge.js');
+  fs.copyFileSync(source, target);
+}
+
+function patchRuntimeSqliteBridge(source) {
+  let patched = source;
+
+  if (!patched.includes("require('./runtime-sqlite-bridge')")) {
+    patched = patched.replace(
+      "const { readManifest, updateBatchStatus, writeManifest } = require('./batch-manifest');",
+      "const { readManifest, updateBatchStatus, writeManifest } = require('./batch-manifest');\nconst { updateRuntimeBatchStatus } = require('./runtime-sqlite-bridge');",
+    );
   }
+
+  patched = patched.replace(
+    `function updateManifestStatus(status, extra = {}) {
+  if (!MANIFEST_PATH || !BATCH_NUMBER) {
+    return;
+  }
+  const manifest = readManifest(MANIFEST_PATH);
+  if (!manifest) {
+    return;
+  }
+  updateBatchStatus(manifest, BATCH_NUMBER, status, extra);
+  writeManifest(MANIFEST_PATH, manifest);
+}`,
+    `function updateManifestStatus(status, extra = {}) {
+  updateManifestStatusForBatch(BATCH_NUMBER, status, extra);
+}`,
+  );
+
+  patched = patched.replace(
+    `function updateManifestStatusForBatch(batchNumber, status, extra = {}) {
+  if (!MANIFEST_PATH || !batchNumber) {
+    return;
+  }
+  const manifest = readManifest(MANIFEST_PATH);
+  if (!manifest) {
+    return;
+  }
+  updateBatchStatus(manifest, batchNumber, status, extra);
+  writeManifest(MANIFEST_PATH, manifest);
+}`,
+    `function updateManifestStatusForBatch(batchNumber, status, extra = {}) {
+  if (!MANIFEST_PATH || !batchNumber) {
+    return;
+  }
+  const manifest = readManifest(MANIFEST_PATH);
+  if (manifest) {
+    updateBatchStatus(manifest, batchNumber, status, extra);
+    writeManifest(MANIFEST_PATH, manifest);
+  }
+  try {
+    const sqliteResult = updateRuntimeBatchStatus({
+      manifestPath: MANIFEST_PATH,
+      batchNumber,
+      status,
+      extra,
+    });
+    if (sqliteResult && sqliteResult.updated) {
+      console.log(\`  🗄️ SQLite 批次状态已更新: batch=\${batchNumber}, status=\${status}\`);
+    } else if (sqliteResult) {
+      console.log(\`  ⚠️ SQLite 批次状态未更新: batch=\${batchNumber}, status=\${status}, reason=\${sqliteResult.reason || 'unknown'}\`);
+    }
+  } catch (error) {
+    console.log(\`  ⚠️ SQLite 批次状态更新失败: \${error.message}\`);
+  }
+}`,
+  );
+
+  return patched;
 }
 
 function patchZeroSendConfirm(source) {
@@ -63,20 +130,20 @@ function patchZeroSendConfirm(source) {
 }
 
 function prepareRuntimeAutoScript(sourceScript) {
-  fs.mkdirSync(runtimeRoot, { recursive: true });
-  for (const fileName of ['auth-config.js', 'batch-manifest.js']) {
-    copyRuntimeDependency(fileName);
-  }
+  fs.mkdirSync(ownedRuntimeRoot, { recursive: true });
+  writeRuntimeSqliteBridge();
 
-  const source = fs.readFileSync(sourceScript, 'utf8');
-  const patched = patchZeroSendConfirm(source);
-  const target = path.join(runtimeRoot, 'proboost-auto.js');
-  fs.writeFileSync(target, patched);
+  const target = sourceScript || ownedAutoScript;
+  const source = fs.readFileSync(target, 'utf8');
+  const patched = patchZeroSendConfirm(patchRuntimeSqliteBridge(source));
+  if (patched !== source) fs.writeFileSync(target, patched);
   return target;
 }
 
 module.exports = {
-  runtimeRoot,
+  ownedRuntimeRoot,
+  ownedAutoScript,
+  patchRuntimeSqliteBridge,
   patchZeroSendConfirm,
   prepareRuntimeAutoScript,
 };

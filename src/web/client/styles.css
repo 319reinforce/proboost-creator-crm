@@ -1,10 +1,10 @@
 :root {
-  --crm-ink: oklch(23% 0.028 248);
-  --crm-muted: oklch(53% 0.024 248);
-  --crm-line: oklch(86% 0.022 94);
-  --crm-panel: oklch(99% 0.008 86);
-  --crm-panel-tint: oklch(96% 0.016 118);
-  --crm-blue: oklch(52% 0.13 205);
+  --crm-ink: oklch(20% 0.02 255);
+  --crm-muted: oklch(55% 0.015 255);
+  --crm-line: oklch(90% 0.01 255);
+  --crm-panel: oklch(100% 0 0);
+  --crm-panel-tint: oklch(97% 0.015 255);
+  --crm-blue: oklch(58% 0.15 255);
   --crm-green: oklch(55% 0.13 151);
   --crm-amber: oklch(66% 0.14 74);
   --crm-red: oklch(56% 0.18 29);
@@ -14,12 +14,12 @@
 
 @media (prefers-color-scheme: dark) {
   :root {
-    --crm-ink: oklch(91% 0.016 92);
-    --crm-muted: oklch(68% 0.02 92);
-    --crm-line: oklch(36% 0.028 248);
-    --crm-panel: oklch(24% 0.024 248);
-    --crm-panel-tint: oklch(30% 0.034 214);
-    --crm-blue: oklch(70% 0.12 200);
+    --crm-ink: oklch(95% 0.01 255);
+    --crm-muted: oklch(65% 0.015 255);
+    --crm-line: oklch(30% 0.02 255);
+    --crm-panel: oklch(20% 0.02 255);
+    --crm-panel-tint: oklch(24% 0.03 255);
+    --crm-blue: oklch(70% 0.15 255);
     --crm-green: oklch(72% 0.13 151);
     --crm-amber: oklch(77% 0.13 76);
     --crm-red: oklch(71% 0.15 29);
@@ -95,6 +95,189 @@
 .notice.error {
   color: var(--crm-red);
   background: color-mix(in oklch, var(--crm-red) 13%, transparent);
+}
+
+.danger-action {
+  border-color: color-mix(in oklch, var(--crm-red) 82%, black);
+  background: linear-gradient(180deg, color-mix(in oklch, var(--crm-red) 84%, white), var(--crm-red));
+}
+
+.send-app {
+  margin-top: 18px;
+}
+
+.send-stat-grid {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+
+.work-order-card {
+  display: grid;
+  gap: 16px;
+  padding: 16px;
+}
+
+.work-order-head {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(280px, 360px);
+  gap: 18px;
+  align-items: start;
+}
+
+.work-order-title {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 9px;
+}
+
+.work-order-title h3 {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  font-size: 18px;
+  font-weight: 860;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.work-order-paths {
+  display: grid;
+  gap: 5px;
+  margin-top: 9px;
+  color: var(--crm-muted);
+  font-size: 12px;
+}
+
+.work-order-paths span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.send-form {
+  display: grid;
+  gap: 10px;
+}
+
+.send-form label {
+  display: grid;
+  gap: 5px;
+  margin: 0;
+  color: var(--crm-muted);
+  font-size: 12px;
+  font-weight: 780;
+}
+
+.send-form input {
+  min-height: 38px;
+  border: 1px solid var(--crm-line);
+  border-radius: 8px;
+  padding: 0 10px;
+  color: var(--crm-ink);
+  background: color-mix(in oklch, var(--crm-panel) 94%, transparent);
+}
+
+.work-order-metrics {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.work-order-metrics div {
+  min-width: 0;
+  border: 1px solid color-mix(in oklch, var(--crm-line) 78%, transparent);
+  border-radius: 8px;
+  padding: 10px;
+  background: color-mix(in oklch, var(--crm-panel-tint) 58%, transparent);
+}
+
+.work-order-metrics strong {
+  display: block;
+  font-size: 18px;
+  font-weight: 860;
+  line-height: 1;
+}
+
+.work-order-metrics span {
+  display: block;
+  margin-top: 6px;
+  color: var(--crm-muted);
+  font-size: 11px;
+  font-weight: 760;
+}
+
+.work-order-log,
+.batch-details {
+  color: var(--crm-ink);
+}
+
+.work-order-log summary,
+.batch-details summary {
+  cursor: pointer;
+  color: var(--crm-muted);
+  font-size: 13px;
+  font-weight: 780;
+}
+
+.work-order-log a {
+  color: var(--crm-blue);
+}
+
+.work-order-log pre {
+  max-height: 180px;
+  overflow: auto;
+  border: 1px solid var(--crm-line);
+  border-radius: 8px;
+  padding: 12px;
+  color: var(--crm-ink);
+  background: color-mix(in oklch, var(--crm-panel-tint) 62%, transparent);
+  white-space: pre-wrap;
+}
+
+.batch-details .table-shell {
+  margin-top: 10px;
+}
+
+.batch-table td:nth-child(2),
+.batch-table td:nth-child(6),
+.batch-table td:nth-child(7) {
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.empty-panel {
+  padding: 18px;
+}
+
+.send-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  color: var(--crm-muted);
+  font-size: 13px;
+  font-weight: 760;
+}
+
+.send-pagination button {
+  display: inline-flex;
+  min-height: 34px;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid var(--crm-line);
+  border-radius: 8px;
+  padding: 0 10px;
+  color: var(--crm-ink);
+  background: color-mix(in oklch, var(--crm-panel) 92%, transparent);
+}
+
+.send-pagination button:disabled {
+  cursor: not-allowed;
+  opacity: 0.48;
 }
 
 .dashboard-band {
@@ -451,14 +634,17 @@
   }
 
   .dashboard-grid,
-  .progress-visual {
+  .progress-visual,
+  .work-order-head,
+  .work-order-metrics {
     grid-template-columns: 1fr;
   }
 }
 
 @media (max-width: 640px) {
   .dashboard-head,
-  .followup-panel {
+  .followup-panel,
+  .send-pagination {
     align-items: stretch;
     flex-direction: column;
   }

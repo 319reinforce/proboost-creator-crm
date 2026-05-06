@@ -2,7 +2,6 @@ const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
 const config = require('../config');
-const { splitScript, autoScript } = require('./paths');
 const {
   openDb,
   initDb,
@@ -14,7 +13,8 @@ const {
 } = require('../db');
 const { readManifest, writeJson, updateBatchStatus } = require('./manifest');
 const { syncManifestToCrm } = require('./syncToCrm');
-const { prepareRuntimeAutoScript } = require('./runtimeScript');
+const { ownedAutoScript, prepareRuntimeAutoScript } = require('./runtimeScript');
+const { splitCreators } = require('./splitCreators');
 
 const uploadsDir = path.join(config.rootDir, 'data', 'uploads');
 const batchesDir = path.join(config.rootDir, 'data', 'send-mail-batches');
@@ -141,15 +141,16 @@ async function splitUploadedFile(filePath, options = {}) {
   const manifestPath = path.join(outputDir, 'manifest.json');
   const logFile = path.join(runsDir, `${campaignName}-split.log`);
 
-  await runNode(splitScript, {
-    INPUT_FILE: filePath,
-    OUTPUT_DIR: outputDir,
-    BATCH_SIZE: String(batchSize),
-    MANIFEST_PATH: manifestPath,
-  }, logFile);
+  ensureDir(runsDir);
+  const splitResult = splitCreators({
+    inputFile: filePath,
+    outputDir,
+    batchSize,
+    manifestPath,
+  });
+  fs.writeFileSync(logFile, `${splitResult.log}\n`);
 
-  const manifest = readManifest(manifestPath);
-  if (!manifest) throw new Error(`manifest not found after split: ${manifestPath}`);
+  const manifest = splitResult.manifest;
   manifest.campaignName = campaignName;
   manifest.originalUpload = filePath;
   manifest.splitLog = logFile;
@@ -199,7 +200,7 @@ async function runBatch(manifestPath, batchNumber, options = {}) {
     PAGE_SIZE: String(options.pageSize || 500),
   };
 
-  const runnableAutoScript = prepareRuntimeAutoScript(autoScript);
+  const runnableAutoScript = prepareRuntimeAutoScript(ownedAutoScript);
   const heartbeat = () => withDb(db => heartbeatSendMailBatches(db, {
     taskRunId,
     batchNumbers: [Number(batchNumber)],
@@ -265,7 +266,7 @@ async function runPending(manifestPath, options = {}) {
     PAGE_SIZE: String(options.pageSize || 500),
   };
 
-  const runnableAutoScript = prepareRuntimeAutoScript(autoScript);
+  const runnableAutoScript = prepareRuntimeAutoScript(ownedAutoScript);
   const heartbeat = () => withDb(db => heartbeatSendMailBatches(db, {
     taskRunId,
     batchNumbers: claimedNumbers,

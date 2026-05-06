@@ -10,6 +10,7 @@ const path = require('path');
 const fs = require('fs');
 const { DEFAULT_USER_ID, resolveAuthConfig, ensureAuthDirs, clearAuthData } = require('./auth-config');
 const { readManifest, updateBatchStatus, writeManifest } = require('./batch-manifest');
+const { updateRuntimeBatchStatus } = require('./runtime-sqlite-bridge');
 
 const DEFAULT_XLSX = path.join(__dirname, 'creators', '已建联达人_邮箱_2026-04-13 (2).xlsx');
 const authConfig = resolveAuthConfig({ baseDir: __dirname, stateFileName: 'storage-state.json' });
@@ -117,15 +118,7 @@ async function hydrateCookies(context) {
 }
 
 function updateManifestStatus(status, extra = {}) {
-  if (!MANIFEST_PATH || !BATCH_NUMBER) {
-    return;
-  }
-  const manifest = readManifest(MANIFEST_PATH);
-  if (!manifest) {
-    return;
-  }
-  updateBatchStatus(manifest, BATCH_NUMBER, status, extra);
-  writeManifest(MANIFEST_PATH, manifest);
+  updateManifestStatusForBatch(BATCH_NUMBER, status, extra);
 }
 
 function updateManifestStatusForBatch(batchNumber, status, extra = {}) {
@@ -133,11 +126,25 @@ function updateManifestStatusForBatch(batchNumber, status, extra = {}) {
     return;
   }
   const manifest = readManifest(MANIFEST_PATH);
-  if (!manifest) {
-    return;
+  if (manifest) {
+    updateBatchStatus(manifest, batchNumber, status, extra);
+    writeManifest(MANIFEST_PATH, manifest);
   }
-  updateBatchStatus(manifest, batchNumber, status, extra);
-  writeManifest(MANIFEST_PATH, manifest);
+  try {
+    const sqliteResult = updateRuntimeBatchStatus({
+      manifestPath: MANIFEST_PATH,
+      batchNumber,
+      status,
+      extra,
+    });
+    if (sqliteResult && sqliteResult.updated) {
+      console.log(`  🗄️ SQLite 批次状态已更新: batch=${batchNumber}, status=${status}`);
+    } else if (sqliteResult) {
+      console.log(`  ⚠️ SQLite 批次状态未更新: batch=${batchNumber}, status=${status}, reason=${sqliteResult.reason || 'unknown'}`);
+    }
+  } catch (error) {
+    console.log(`  ⚠️ SQLite 批次状态更新失败: ${error.message}`);
+  }
 }
 
 function appendPendingBatchesAfterCurrent(batchNumbers, currentBatch) {
@@ -645,6 +652,32 @@ async function tryConfirmSend(page) {
         if (!isSendConfirmModal) continue;
 
         const buttons = Array.from(modal.querySelectorAll('.ant-modal-footer button')).filter(isVisible);
+
+        if (isSendConfirmModal && /本次操作将发送0封邮件|发送0封邮件|将发送0封邮件/.test(modalText)) {
+          const cancelBtn = buttons.find(button => {
+            const text = normalize(button.innerText || button.textContent || '');
+            const disabled = button.disabled || button.getAttribute('aria-disabled') === 'true';
+            return !disabled && (text.includes('取消') || text.includes('关闭'));
+          });
+          const closeBtn = modal.querySelector('.ant-modal-close');
+          if (cancelBtn) cancelBtn.click();
+          else if (closeBtn) closeBtn.click();
+          return 'zero-send';
+        }
+
+
+        if (isSendConfirmModal && /本次操作将发送0封邮件|发送0封邮件|将发送0封邮件/.test(modalText)) {
+          const cancelBtn = buttons.find(button => {
+            const text = normalize(button.innerText || button.textContent || '');
+            const disabled = button.disabled || button.getAttribute('aria-disabled') === 'true';
+            return !disabled && (text.includes('取消') || text.includes('关闭'));
+          });
+          const closeBtn = modal.querySelector('.ant-modal-close');
+          if (cancelBtn) cancelBtn.click();
+          else if (closeBtn) closeBtn.click();
+          return 'zero-send';
+        }
+
 
         if (isSendConfirmModal && /本次操作将发送0封邮件|发送0封邮件|将发送0封邮件/.test(modalText)) {
           const cancelBtn = buttons.find(button => {
@@ -1217,6 +1250,38 @@ async function main() {
         // 某些场景确认弹窗会延后渲染，这里再补一次重试
         await page.waitForTimeout(1200);
         confirmed = await tryConfirmSend(page);
+      }
+      if (confirmed === 'zero-send') {
+        console.log('  ℹ️ 确认发送弹窗显示本次将发送 0 封邮件，已关闭弹窗并跳过本批次。');
+        await clearFreshSuccessSignal(page);
+        updateManifestStatusForBatch(currentBatch, 'sent', {
+          inputFile,
+          sentAt: new Date().toISOString(),
+          selectedCount: 0,
+          skipped: true,
+          reason: 'send-confirm-zero',
+        });
+        const appended = appendPendingBatchesAfterCurrent(batchNumbers, currentBatch);
+        if (appended.length > 0) {
+          console.log(`ℹ️ 当前批次已跳过，自动继续后续待处理批次: [${appended.join(', ')}]`);
+        }
+        continue;
+      }
+      if (confirmed === 'zero-send') {
+        console.log('  ℹ️ 确认发送弹窗显示本次将发送 0 封邮件，已关闭弹窗并跳过本批次。');
+        await clearFreshSuccessSignal(page);
+        updateManifestStatusForBatch(currentBatch, 'sent', {
+          inputFile,
+          sentAt: new Date().toISOString(),
+          selectedCount: 0,
+          skipped: true,
+          reason: 'send-confirm-zero',
+        });
+        const appended = appendPendingBatchesAfterCurrent(batchNumbers, currentBatch);
+        if (appended.length > 0) {
+          console.log(`ℹ️ 当前批次已跳过，自动继续后续待处理批次: [${appended.join(', ')}]`);
+        }
+        continue;
       }
       if (confirmed === 'zero-send') {
         console.log('  ℹ️ 确认发送弹窗显示本次将发送 0 封邮件，已关闭弹窗并跳过本批次。');

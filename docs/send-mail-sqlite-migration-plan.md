@@ -82,16 +82,20 @@ Deliverables:
 
 Goal: make the spawned automation update SQLite directly.
 
+Status: implemented. The project-owned runtime script updates SQLite through `runtime-sqlite-bridge` whenever the legacy-compatible batch status helper is called. The compatibility manifest is still written so the current automation loop can resolve batch files and continue chained runs, but SQLite receives the terminal and selected-count updates directly.
+
 Deliverables:
 
-- Introduce a small runtime bridge module copied into `.send-mail-runtime`.
-- Replace manifest update calls in the runtime script with SQLite/API status updates.
-- Keep the external `/Users/depp/send-mail` source untouched if possible by patching at runtime.
+- Introduce a small runtime bridge module under `src/sendMailBridge/runtime/`.
+- Replace manifest update calls in the runtime script with SQLite status updates.
+- Keep the external `/Users/depp/send-mail` source untouched; the production runtime source is now project-owned.
 - Remove post-run manifest sync once runtime updates are reliable.
 
 ### Phase 5: Manifest Retirement
 
 Goal: remove manifest as durable state.
+
+Status: implemented for CRM-owned surfaces. Dashboard and `/send` read from SQLite JSON APIs, upload/split lands campaigns and batches in SQLite, and manifest files are now treated as compatibility inputs for the current automation runner rather than durable state. Full deletion of the compatibility file is deferred until the runner no longer needs `MANIFEST_PATH` to resolve chained batch lists.
 
 Deliverables:
 
@@ -103,9 +107,11 @@ Deliverables:
 
 Goal: remove the external `/Users/depp/send-mail` dependency and make this repository a clone-and-run system.
 
+Status: implemented for the production split/send entrypoints. The Excel split logic is owned by `src/sendMailBridge/splitCreators.js`, and the send automation runtime is owned under `src/sendMailBridge/runtime/`. `src/sendMailBridge/paths.js` and `SEND_MAIL_ROOT` are no longer used by production code.
+
 Why this exists:
 
-Phase 4 fixes the state-sync contract while preserving the external automation script as a compatibility bridge. That is not the final architecture. As long as CRM shells out to `/Users/depp/send-mail/proboost-auto.js` or `/Users/depp/send-mail/split-creators.js`, the system still depends on local absolute paths, implicit environment variables, and files that are not versioned with this repo.
+Phase 4 fixed the state-sync contract first. Phase 6 then moved the production split and send entrypoints into this repository so CRM no longer shells out to `/Users/depp/send-mail/proboost-auto.js` or `/Users/depp/send-mail/split-creators.js`.
 
 Deliverables:
 

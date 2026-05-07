@@ -5,6 +5,8 @@ const {
   findMailTable,
   extractMailRows,
   robustOpenMailRow,
+  getMailRowSnapshot,
+  openMailRowWithStrategy,
   waitForMailDetail,
   captureDomFailure,
   summarizeDomFailure,
@@ -20,6 +22,14 @@ function senderMatchesHandle(sender, handle) {
   return normalizeKey(sender) === normalizeKey(handle);
 }
 
+function normalizeCompactText(value) {
+  return String(value || '').replace(/\s+/g, '').trim();
+}
+
+function replyLikeText(value) {
+  return normalizeCompactText(value).includes(SELECTORS.repliedStatus.fuzzyContains || '回复');
+}
+
 async function waitForInboxTable(page, timeout = 30000) {
   return Boolean(await findMailTable(page, { timeout }));
 }
@@ -31,7 +41,15 @@ async function goToMailModule(page) {
 }
 
 async function goToInbox(page) {
-  await page.goto(config.proboostUrl, { waitUntil: 'domcontentloaded', timeout: config.pageLoadTimeout });
+  try {
+    await page.goto(config.proboostUrl, { waitUntil: 'domcontentloaded', timeout: config.pageLoadTimeout });
+  } catch (error) {
+    const failure = await captureDomFailure(page, 'mailbox-entry-failed', {
+      targetUrl: config.proboostUrl,
+      error: String(error.message || error),
+    });
+    throw new Error(`Inbox navigation failed. ${summarizeDomFailure(failure)}; cause=${String(error.message || error)}`);
+  }
   await page.waitForTimeout(1800);
   const loginRequired = await page.evaluate(() => {
     const text = document.body?.innerText || '';
@@ -91,8 +109,8 @@ async function goToSent(page) {
   await page.waitForTimeout(2000);
 }
 
-async function selectMailStatus(page, statusText) {
-  const selected = await page.evaluate((label) => {
+async function openMailStatusDropdown(page) {
+  const opened = await page.evaluate(() => {
     const normalize = value => String(value || '').replace(/\s+/g, '').trim();
     const visible = element => {
       if (!element) return false;
@@ -112,16 +130,54 @@ async function selectMailStatus(page, statusText) {
     trigger.scrollIntoView({ block: 'center', inline: 'nearest' });
     trigger.click();
     return true;
-  }, statusText).catch(() => false);
+  }).catch(() => false);
 
-  if (!selected) {
+  if (!opened) {
     const status = page.locator('span:has-text("邮件状态"), .ant-select').first();
     if (await status.isVisible().catch(() => false)) await status.click();
   }
 
   await page.waitForTimeout(800);
+  return opened || await page.evaluate(() => {
+    const visible = element => {
+      if (!element) return false;
+      const style = window.getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return style.display !== 'none'
+        && style.visibility !== 'hidden'
+        && style.opacity !== '0'
+        && rect.width > 0
+        && rect.height > 0;
+    };
+    return Array.from(document.querySelectorAll('.ant-select-dropdown:not(.ant-select-dropdown-hidden)')).some(visible);
+  }).catch(() => false);
+}
 
-  const optionClicked = await page.evaluate((label) => {
+async function listMailStatusOptions(page) {
+  return await page.evaluate(() => {
+    const visible = element => {
+      if (!element) return false;
+      const style = window.getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return style.display !== 'none'
+        && style.visibility !== 'hidden'
+        && style.opacity !== '0'
+        && rect.width > 0
+        && rect.height > 0;
+    };
+    return Array.from(document.querySelectorAll('.ant-select-dropdown:not(.ant-select-dropdown-hidden) .ant-select-item-option, .ant-select-dropdown:not(.ant-select-dropdown-hidden) [role="option"]'))
+      .filter(visible)
+      .map((option, index) => ({
+        index,
+        text: String(option.innerText || option.textContent || '').replace(/\s+/g, ' ').trim(),
+      }))
+      .filter(item => item.text)
+      .filter((item, index, list) => list.findIndex(other => other.text === item.text) === index);
+  }).catch(() => []);
+}
+
+async function selectVisibleStatusOption(page, optionText) {
+  const clicked = await page.evaluate((label) => {
     const normalize = value => String(value || '').replace(/\s+/g, '').trim();
     const visible = element => {
       if (!element) return false;
@@ -133,32 +189,135 @@ async function selectMailStatus(page, statusText) {
         && rect.width > 0
         && rect.height > 0;
     };
-    const options = Array.from(document.querySelectorAll('.ant-select-dropdown:not(.ant-select-dropdown-hidden) .ant-select-item-option, .ant-select-dropdown:not(.ant-select-dropdown-hidden) *'))
+    const candidates = Array.from(document.querySelectorAll('.ant-select-dropdown:not(.ant-select-dropdown-hidden) .ant-select-item-option, .ant-select-dropdown:not(.ant-select-dropdown-hidden) [role="option"], .ant-select-dropdown:not(.ant-select-dropdown-hidden) *'))
       .filter(visible);
-    const target = options.find(option => normalize(option.innerText || option.textContent || '') === normalize(label));
+    const target = candidates.find(option => normalize(option.innerText || option.textContent || '') === normalize(label));
     if (!target) return false;
     target.scrollIntoView({ block: 'center', inline: 'nearest' });
     target.click();
     return true;
-  }, statusText).catch(() => false);
+  }, optionText).catch(() => false);
+  if (clicked) await page.waitForTimeout(1800);
+  return clicked;
+}
 
-  if (!optionClicked) {
+async function selectMailStatusByCandidates(page, candidates = []) {
+  const opened = await openMailStatusDropdown(page);
+  const options = opened ? await listMailStatusOptions(page) : [];
+  if (!opened && options.length === 0) {
     await page.keyboard.press('Escape').catch(() => {});
-    return false;
+    return { ok: false, reason: 'replied-status-filter-not-found', options };
   }
-  await page.waitForTimeout(1800);
-  return true;
+
+  const normalizedOptions = options.map(option => ({
+    ...option,
+    compact: normalizeCompactText(option.text),
+  }));
+  const exactCandidates = candidates.map(normalizeCompactText).filter(Boolean);
+  let selected = normalizedOptions.find(option => exactCandidates.includes(option.compact));
+  let matchType = 'exact';
+
+  if (!selected) {
+    selected = normalizedOptions.find(option => replyLikeText(option.text));
+    matchType = 'fuzzy';
+  }
+
+  if (!selected) {
+    await page.keyboard.press('Escape').catch(() => {});
+    return { ok: false, reason: 'replied-status-option-not-found', options };
+  }
+
+  const clicked = await selectVisibleStatusOption(page, selected.text);
+  if (!clicked) {
+    await page.keyboard.press('Escape').catch(() => {});
+    return { ok: false, reason: 'replied-status-option-click-failed', options, selected: selected.text };
+  }
+
+  return { ok: true, selected: selected.text, matchType, options };
+}
+
+async function selectMailStatus(page, statusText) {
+  const result = await selectMailStatusByCandidates(page, [statusText]);
+  return result.ok;
+}
+
+async function tryKnownMailboxRoute(page, mailbox) {
+  if (mailbox !== 'replied' || !config.repliedUrl) return { ok: false, reason: 'no-known-route' };
+  try {
+    await page.goto(config.repliedUrl, { waitUntil: 'domcontentloaded', timeout: config.pageLoadTimeout });
+    await page.waitForTimeout(1800);
+    const ok = await waitForInboxTable(page, 12000);
+    return ok ? { ok: true, strategy: 'known-route', mailbox } : { ok: false, reason: 'route-table-not-found' };
+  } catch (error) {
+    return { ok: false, reason: 'route-navigation-failed', error: String(error.message || error) };
+  }
+}
+
+async function enterMailbox(page, options = {}) {
+  const mailbox = String(options.mailbox || 'inbox').trim() || 'inbox';
+  if (mailbox === 'inbox') {
+    await goToInbox(page);
+    return { mailbox: 'inbox', strategy: 'inbox' };
+  }
+  if (mailbox !== 'replied') throw new Error(`unsupported mailbox: ${mailbox}`);
+
+  const route = await tryKnownMailboxRoute(page, mailbox);
+  if (route.ok) return route;
+
+  await goToInbox(page);
+  const selected = await selectMailStatusByCandidates(page, SELECTORS.repliedStatus.candidates || [SELECTORS.repliedStatus.text]);
+  if (!selected.ok) {
+    const feature = selected.reason === 'replied-status-filter-not-found'
+      ? 'replied-status-filter-not-found'
+      : 'replied-status-option-not-found';
+    const failure = await captureDomFailure(page, feature, {
+      mailbox,
+      routeAttempt: route,
+      candidates: SELECTORS.repliedStatus.candidates || [SELECTORS.repliedStatus.text],
+      options: selected.options || [],
+      selected: selected.selected || '',
+    });
+    if (options.allowFallback !== false) {
+      return {
+        mailbox: 'inbox',
+        requestedMailbox: mailbox,
+        mailboxFallback: 'inbox',
+        strategy: 'inbox-fallback',
+        reason: selected.reason,
+        diagnosticPath: failure.jsonPath || '',
+        screenshotPath: failure.screenshotPath || '',
+        options: selected.options || [],
+      };
+    }
+    throw new Error(`mail status filter failed: ${selected.reason}; ${summarizeDomFailure(failure)}`);
+  }
+
+  const ok = await waitForInboxTable(page, 15000);
+  if (!ok) {
+    const failure = await captureDomFailure(page, 'mail-table-not-found-after-filter', {
+      mailbox,
+      selected: selected.selected,
+      matchType: selected.matchType,
+      options: selected.options || [],
+    });
+    throw new Error(`Replied inbox table not ready. ${summarizeDomFailure(failure)}`);
+  }
+
+  return {
+    mailbox: 'replied',
+    requestedMailbox: mailbox,
+    strategy: selected.matchType === 'fuzzy' ? 'status-fuzzy' : 'status-exact',
+    selectedStatus: selected.selected,
+    statusOptions: selected.options || [],
+  };
 }
 
 async function enterRepliedInbox(page) {
+  return await enterMailbox(page, { mailbox: 'replied' });
+}
+
+async function enterInbox(page) {
   await goToInbox(page);
-  const selected = await selectMailStatus(page, '已回复');
-  if (!selected) throw new Error('mail status filter "已回复" not found');
-  const ok = await waitForInboxTable(page, 15000);
-  if (!ok) {
-    const failure = await captureDomFailure(page, 'replied-inbox-table-not-ready', { statusText: '已回复' });
-    throw new Error(`Replied inbox table not ready. ${summarizeDomFailure(failure)}`);
-  }
 }
 
 async function setPageSize(page, preferredSize = config.pageSize) {
@@ -359,24 +518,56 @@ async function clickInboxRowInMailTable(page, rowIndex, cellOrder = [1, 2]) {
   });
 }
 
-async function waitForEmailDetail(page, row, timeout = 12000) {
-  return await waitForMailDetail(page, row, { timeout });
+async function waitForEmailDetail(page, row, timeout = 12000, startUrl = '') {
+  return await waitForMailDetail(page, row, { timeout, startUrl });
 }
 
 async function openInboxResult(page, row) {
+  const beforeUrl = page.url();
   const attempts = [
-    () => clickInboxRowInMailTable(page, row.rowIndex, [1, 2]),
-    () => clickInboxRowInMailTable(page, row.rowIndex, [2, 1]),
-    () => clickInboxRow(page, row.rowIndex),
+    { strategy: 'dom-known-cell', cellOrder: [1, 2] },
+    { strategy: 'dom-known-cell', cellOrder: [2, 1] },
+    { strategy: 'mouse-cell-center', cellOrder: [1, 2] },
+    { strategy: 'double-click-row-center', cellOrder: [1, 2] },
+    { strategy: 'focus-enter', cellOrder: [1, 2] },
+    { strategy: 'click-pointer-ancestor', cellOrder: [1, 2] },
+    { strategy: 'href-navigate', cellOrder: [1, 2] },
   ];
+  const failures = [];
 
   for (const attempt of attempts) {
-    const opened = await attempt();
-    const detailReady = opened ? await waitForEmailDetail(page, row) : false;
-    if (detailReady) return true;
+    const opened = await openMailRowWithStrategy(page, row.rowIndex, attempt.strategy, {
+      cellOrder: attempt.cellOrder,
+      waitAfterMs: 1200,
+    });
+    const detailReady = opened.ok ? await waitForEmailDetail(page, row, 12000, beforeUrl) : false;
+    if (detailReady) {
+      return {
+        ok: true,
+        openStrategy: attempt.strategy,
+        urlBefore: beforeUrl,
+        urlAfter: page.url(),
+      };
+    }
+    failures.push({
+      strategy: attempt.strategy,
+      reason: opened.reason || (opened.ok ? 'detail-not-ready' : 'open-failed'),
+      urlAfter: page.url(),
+    });
+    if (page.url() !== beforeUrl) {
+      await page.goBack({ waitUntil: 'domcontentloaded', timeout: config.pageLoadTimeout }).catch(() => {});
+      await waitForInboxTable(page, 8000).catch(() => {});
+    }
   }
 
-  const failure = await captureDomFailure(page, 'email-detail-open-failed', { row });
+  const rowSnapshot = await getMailRowSnapshot(page, row.rowIndex).catch(() => null);
+  const failure = await captureDomFailure(page, 'email-detail-open-failed', {
+    row,
+    rowSnapshot,
+    urlBefore: beforeUrl,
+    urlAfter: page.url(),
+    attempts: failures,
+  });
   throw new Error(`email detail did not open; row=${row.rowIndex}; sender=${row.sender || ''}; subject=${row.subject || ''}; ${summarizeDomFailure(failure)}`);
 }
 
@@ -647,7 +838,12 @@ module.exports = {
   replyToOpenedThread,
   verifySentRecord,
   senderMatchesHandle,
+  enterInbox,
+  enterMailbox,
   enterRepliedInbox,
+  openMailStatusDropdown,
+  listMailStatusOptions,
+  selectMailStatusByCandidates,
   setPageSize,
   goToFirstPage,
   goToNextPage,

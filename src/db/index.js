@@ -52,6 +52,27 @@ function migrateDb(db) {
       db.prepare(`ALTER TABLE send_mail_batches ADD COLUMN ${column} ${type}`).run();
     }
   }
+  const mailThreadColumns = [
+    ['sync_status', 'TEXT'],
+    ['last_sync_error', 'TEXT'],
+    ['last_open_strategy', 'TEXT'],
+    ['raw_snapshot_path', 'TEXT'],
+  ];
+  for (const [column, type] of mailThreadColumns) {
+    if (!columnExists(db, 'mail_threads', column)) {
+      db.prepare(`ALTER TABLE mail_threads ADD COLUMN ${column} ${type}`).run();
+    }
+  }
+  const mailMessageColumns = [
+    ['provider_message_id', 'TEXT'],
+    ['body_hash', 'TEXT'],
+    ['sync_run_id', 'TEXT'],
+  ];
+  for (const [column, type] of mailMessageColumns) {
+    if (!columnExists(db, 'mail_messages', column)) {
+      db.prepare(`ALTER TABLE mail_messages ADD COLUMN ${column} ${type}`).run();
+    }
+  }
   db.exec(`
     CREATE UNIQUE INDEX IF NOT EXISTS idx_send_logs_external_key
     ON send_logs (external_source, external_id)
@@ -67,6 +88,17 @@ function migrateDb(db) {
 
     CREATE INDEX IF NOT EXISTS idx_send_mail_batches_task_run
     ON send_mail_batches (task_run_id);
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_mail_messages_provider_message
+    ON mail_messages (provider_message_id)
+    WHERE provider_message_id IS NOT NULL;
+
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_mail_messages_thread_body_hash
+    ON mail_messages (thread_id, body_hash)
+    WHERE body_hash IS NOT NULL;
+
+    CREATE INDEX IF NOT EXISTS idx_mail_threads_sync_status
+    ON mail_threads (sync_status);
   `);
 }
 
@@ -556,7 +588,7 @@ function claimSendMailBatch(db, { manifestPath, batchNumber, taskRunId, claimedB
         updated_at = CURRENT_TIMESTAMP
     WHERE send_mail_campaign_id = @campaign_id
       AND batch_number = @batch_number
-      AND status = 'pending'
+      AND status IN ('pending', 'failed')
   `).run({
     status,
     task_run_id: taskRunId || null,
@@ -786,6 +818,10 @@ function upsertMailThread(db, payload) {
           first_message_at = COALESCE(first_message_at, @first_message_at),
           last_message_at = COALESCE(@last_message_at, last_message_at),
           last_synced_at = COALESCE(@last_synced_at, CURRENT_TIMESTAMP),
+          sync_status = COALESCE(@sync_status, sync_status),
+          last_sync_error = @last_sync_error,
+          last_open_strategy = COALESCE(@last_open_strategy, last_open_strategy),
+          raw_snapshot_path = COALESCE(@raw_snapshot_path, raw_snapshot_path),
           status = COALESCE(@status, status),
           updated_at = CURRENT_TIMESTAMP
       WHERE id = @id
@@ -799,6 +835,10 @@ function upsertMailThread(db, payload) {
       first_message_at: payload.first_message_at || null,
       last_message_at: payload.last_message_at || null,
       last_synced_at: payload.last_synced_at || null,
+      sync_status: payload.sync_status || null,
+      last_sync_error: payload.last_sync_error || null,
+      last_open_strategy: payload.last_open_strategy || null,
+      raw_snapshot_path: payload.raw_snapshot_path || null,
       status: payload.status || null,
     });
     return db.prepare('SELECT * FROM mail_threads WHERE id = ?').get(existing.id);
@@ -815,6 +855,10 @@ function upsertMailThread(db, payload) {
       first_message_at,
       last_message_at,
       last_synced_at,
+      sync_status,
+      last_sync_error,
+      last_open_strategy,
+      raw_snapshot_path,
       status
     )
     VALUES (
@@ -827,6 +871,10 @@ function upsertMailThread(db, payload) {
       @first_message_at,
       @last_message_at,
       @last_synced_at,
+      @sync_status,
+      @last_sync_error,
+      @last_open_strategy,
+      @raw_snapshot_path,
       @status
     )
   `).run({
@@ -839,6 +887,10 @@ function upsertMailThread(db, payload) {
     first_message_at: payload.first_message_at || null,
     last_message_at: payload.last_message_at || null,
     last_synced_at: payload.last_synced_at || new Date().toISOString(),
+    sync_status: payload.sync_status || null,
+    last_sync_error: payload.last_sync_error || null,
+    last_open_strategy: payload.last_open_strategy || null,
+    raw_snapshot_path: payload.raw_snapshot_path || null,
     status: payload.status || 'open',
   });
 
@@ -846,6 +898,63 @@ function upsertMailThread(db, payload) {
 }
 
 function insertMailMessage(db, payload) {
+  const providerMessageId = String(payload.provider_message_id || '').trim() || null;
+  const bodyHash = String(payload.body_hash || '').trim() || null;
+  const existing = providerMessageId
+    ? db.prepare(`
+      SELECT *
+      FROM mail_messages
+      WHERE provider_message_id = ?
+      LIMIT 1
+    `).get(providerMessageId)
+    : bodyHash && payload.thread_id
+      ? db.prepare(`
+        SELECT *
+        FROM mail_messages
+        WHERE thread_id = ?
+          AND body_hash = ?
+        LIMIT 1
+      `).get(payload.thread_id, bodyHash)
+      : null;
+
+  if (existing) {
+    db.prepare(`
+      UPDATE mail_messages
+      SET thread_id = COALESCE(@thread_id, thread_id),
+          creator_id = COALESCE(@creator_id, creator_id),
+          direction = COALESCE(@direction, direction),
+          subject = COALESCE(@subject, subject),
+          sender = COALESCE(@sender, sender),
+          recipient = COALESCE(@recipient, recipient),
+          body_text = COALESCE(@body_text, body_text),
+          body_html = COALESCE(@body_html, body_html),
+          sent_at = COALESCE(@sent_at, sent_at),
+          received_at = COALESCE(@received_at, received_at),
+          raw_snapshot_path = COALESCE(@raw_snapshot_path, raw_snapshot_path),
+          provider_message_id = COALESCE(@provider_message_id, provider_message_id),
+          body_hash = COALESCE(@body_hash, body_hash),
+          sync_run_id = COALESCE(@sync_run_id, sync_run_id)
+      WHERE id = @id
+    `).run({
+      id: existing.id,
+      thread_id: payload.thread_id || null,
+      creator_id: payload.creator_id || null,
+      direction: payload.direction || null,
+      subject: payload.subject || null,
+      sender: payload.sender || null,
+      recipient: payload.recipient || null,
+      body_text: payload.body_text || null,
+      body_html: payload.body_html || null,
+      sent_at: payload.sent_at || null,
+      received_at: payload.received_at || null,
+      raw_snapshot_path: payload.raw_snapshot_path || null,
+      provider_message_id: providerMessageId,
+      body_hash: bodyHash,
+      sync_run_id: payload.sync_run_id || null,
+    });
+    return db.prepare('SELECT * FROM mail_messages WHERE id = ?').get(existing.id);
+  }
+
   const result = db.prepare(`
     INSERT INTO mail_messages (
       thread_id,
@@ -858,7 +967,10 @@ function insertMailMessage(db, payload) {
       body_html,
       sent_at,
       received_at,
-      raw_snapshot_path
+      raw_snapshot_path,
+      provider_message_id,
+      body_hash,
+      sync_run_id
     )
     VALUES (
       @thread_id,
@@ -871,7 +983,10 @@ function insertMailMessage(db, payload) {
       @body_html,
       @sent_at,
       @received_at,
-      @raw_snapshot_path
+      @raw_snapshot_path,
+      @provider_message_id,
+      @body_hash,
+      @sync_run_id
     )
   `).run({
     thread_id: payload.thread_id || null,
@@ -885,6 +1000,9 @@ function insertMailMessage(db, payload) {
     sent_at: payload.sent_at || null,
     received_at: payload.received_at || null,
     raw_snapshot_path: payload.raw_snapshot_path || null,
+    provider_message_id: providerMessageId,
+    body_hash: bodyHash,
+    sync_run_id: payload.sync_run_id || null,
   });
 
   return db.prepare('SELECT * FROM mail_messages WHERE id = ?').get(result.lastInsertRowid);

@@ -74,6 +74,26 @@
   opacity: 0.7;
 }
 
+.icon-action {
+  display: inline-flex;
+  min-height: 32px;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid color-mix(in oklch, var(--crm-blue) 80%, black);
+  border-radius: 8px;
+  padding: 0 10px;
+  color: oklch(98% 0.01 86);
+  background: var(--crm-blue);
+  font-size: 12px;
+  font-weight: 780;
+  white-space: nowrap;
+}
+
+.icon-action:disabled {
+  cursor: progress;
+  opacity: 0.62;
+}
+
 .spin {
   animation: spin 900ms linear infinite;
 }
@@ -247,6 +267,10 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.batch-action-form {
+  margin: 0;
 }
 
 .empty-panel {

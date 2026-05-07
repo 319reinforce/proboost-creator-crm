@@ -14,6 +14,7 @@ const {
 } = require('../db');
 const { loginInteractively } = require('../automation/session');
 const { runReadyFollowupBatch } = require('../automation/reminderRunner');
+const { runMailApiDiscovery, listMailDebugRuns } = require('../automation/mailApiDiscovery');
 const { listManifestPaths, readManifest, updateBatchStatus } = require('../sendMailBridge/manifest');
 const {
   uploadsDir,
@@ -33,6 +34,8 @@ ensureDir(batchesDir);
 ensureDir(runsDir);
 const readyFollowupRunsDir = path.join(config.reportDir, 'ready-followups');
 ensureDir(readyFollowupRunsDir);
+const mailDebugRunsDir = path.join(config.reportDir, 'mail-debug');
+ensureDir(mailDebugRunsDir);
 
 const upload = multer({
   dest: uploadsDir,
@@ -203,6 +206,28 @@ function fixMojibake(value) {
 function displayPath(value) {
   const fixed = fixMojibake(value);
   return fixed.replace(config.rootDir, '.');
+}
+
+function resolveReportArtifact(relativePath) {
+  const cleaned = String(relativePath || '').replace(/^\/+/, '');
+  const resolved = path.resolve(config.rootDir, cleaned);
+  const reportRoot = path.resolve(config.reportDir);
+  if (!resolved.startsWith(`${reportRoot}${path.sep}`) && resolved !== reportRoot) return null;
+  if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) return null;
+  return resolved;
+}
+
+function extractDiagnosticPaths(value) {
+  const text = String(value || '');
+  const matches = text.match(/(?:diagnostic=)?(?:\.?\/)?reports\/dom-failures\/[^\s;'"<>]+\.json|\/[^\s;'"<>]*reports\/dom-failures\/[^\s;'"<>]+\.json/g) || [];
+  return [...new Set(matches.map(item => item.replace(/^diagnostic=/, '')))]
+    .map(item => item.startsWith('/') ? item : path.resolve(config.rootDir, item.replace(/^\.\//, '')));
+}
+
+function renderDiagnosticLinks(value) {
+  const paths = extractDiagnosticPaths(value);
+  if (paths.length === 0) return '';
+  return `<div class="muted">诊断 JSON：${paths.map(item => `<code>${escapeHtml(displayPath(item))}</code>`).join(' ')}</div>`;
 }
 
 function readTail(filePath, maxLines = 18) {
@@ -580,7 +605,7 @@ function renderInboxClassification() {
     <td><span class="status ${job.status === 'failed' ? 'hard-failed' : job.status === 'finished' ? 'sent' : 'prepared'}">${escapeHtml(job.status)}</span></td>
     <td>${escapeHtml(job.templateName || '-')}</td>
     <td>${escapeHtml(job.finishedAt || '-')}</td>
-    <td>${job.error ? `<details><summary>错误</summary><pre>${escapeHtml(job.error)}</pre></details>` : escapeHtml(job.result?.runId || job.runId || '-')}</td>
+    <td>${job.error ? `<details><summary>错误</summary>${renderDiagnosticLinks(job.error)}<pre>${escapeHtml(job.error)}</pre></details>` : escapeHtml(job.result?.runId || job.runId || '-')}</td>
   </tr>`).join('');
 
   return `<section id="inbox-classifier">
@@ -627,6 +652,7 @@ function renderInboxClassification() {
       <summary>最近一次分类结果</summary>
       <div id="followup-summary">${summary}</div>
       <p id="followup-running" class="muted" ${latest.status === 'running' ? '' : 'hidden'}>后台正在检查收件箱，等待实时结果。</p>
+      <div id="followup-diagnostics">${renderDiagnosticLinks(latest.error || '')}</div>
       <pre id="followup-error" ${latest.error ? '' : 'hidden'}>${escapeHtml(latest.error || '')}</pre>
       ${rows ? `<div class="batch-box"><table>
         <thead><tr><th>发件人</th><th>主题</th><th>意图</th><th>推荐动作</th><th>联系方式</th><th>邀请码</th><th>模板</th><th>阶段</th><th>正文字符</th><th>错误</th></tr></thead>
@@ -830,8 +856,145 @@ function followupSummaryPayload() {
       templateName: job.templateName || '',
       runId: job.result?.runId || job.runId || '',
       error: job.error || '',
+      diagnostics: extractDiagnosticPaths(job.error || '').map(displayPath),
     })),
   };
+}
+
+function mailDebugSummaryPayload() {
+  const jobs = recentTaskRuns('mail-debug', 8);
+  const runs = listMailDebugRuns(8).map(item => ({
+    id: item.summary.id || item.name,
+    outDir: displayPath(item.summary.outDir || item.dir),
+    summaryPath: displayPath(item.summary.summaryPath || item.summaryPath),
+    requestPath: displayPath(item.summary.requestPath || ''),
+    responsePath: displayPath(item.summary.responsePath || ''),
+    candidatePath: displayPath(item.summary.candidatePath || ''),
+    mailbox: item.summary.mailbox || '',
+    requestCount: item.summary.requestCount || 0,
+    responseCount: item.summary.responseCount || 0,
+    candidateCount: item.summary.candidateCount || 0,
+    createdAt: item.summary.createdAt || '',
+    rawEnabled: Boolean(item.summary.rawEnabled),
+    candidates: (item.summary.candidates || []).slice(0, 10),
+  }));
+  return {
+    running: jobs.some(job => job.status === 'running'),
+    latestJob: jobs[0] || null,
+    jobs: jobs.map(job => ({
+      id: job.id,
+      status: job.status,
+      startedAt: job.startedAt,
+      finishedAt: job.finishedAt || '',
+      error: job.error || '',
+      result: job.result || null,
+    })),
+    runs,
+  };
+}
+
+function artifactLink(displayedPath) {
+  if (!displayedPath) return '-';
+  const normalized = String(displayedPath).replace(/^\.\//, '');
+  return `<a href="/reports/artifact?path=${encodeURIComponent(normalized)}">${escapeHtml(displayedPath)}</a>`;
+}
+
+function renderCandidateTags(tags = []) {
+  return tags.map(tag => `<span class="status prepared">${escapeHtml(tag)}</span>`).join(' ') || '-';
+}
+
+function renderMailDebugPage() {
+  const payload = mailDebugSummaryPayload();
+  const latest = payload.latestJob;
+  const runs = payload.runs;
+  const latestRun = runs[0];
+  const topCandidates = (latestRun?.candidates || []).slice(0, 8).map(candidate => `<tr>
+    <td>${escapeHtml(candidate.method || 'GET')}</td>
+    <td>${renderCandidateTags(candidate.tags || [])}</td>
+    <td>${escapeHtml((candidate.statuses || []).join(', ') || '-')}</td>
+    <td>${escapeHtml((candidate.contentTypes || []).join(', ') || '-')}</td>
+    <td>${escapeHtml(candidate.url || '-')}</td>
+  </tr>`).join('');
+  const runRows = runs.map(run => `<tr>
+    <td>${escapeHtml(run.createdAt || '-')}</td>
+    <td><span class="status finished">${escapeHtml(run.candidateCount)}</span></td>
+    <td>${escapeHtml(run.requestCount)} / ${escapeHtml(run.responseCount)}</td>
+    <td>${escapeHtml(run.mailbox || '-')}</td>
+    <td>${artifactLink(run.summaryPath)}</td>
+    <td>${artifactLink(run.candidatePath)}</td>
+  </tr>`).join('');
+  const jobRows = payload.jobs.map(job => `<tr>
+    <td>${escapeHtml(job.startedAt || '-')}</td>
+    <td><span class="status ${job.status === 'failed' ? 'hard-failed' : job.status === 'finished' ? 'finished' : 'running'}">${escapeHtml(job.status || '-')}</span></td>
+    <td>${escapeHtml(job.finishedAt || '-')}</td>
+    <td>${job.error ? `<details><summary>错误</summary><pre>${escapeHtml(job.error)}</pre></details>` : escapeHtml(job.result?.id || '-')}</td>
+  </tr>`).join('');
+
+  return `<div id="mail-debug-root"></div>
+  <section class="debug-hero">
+    <div>
+      <h2>邮件 API 验收</h2>
+      <p class="muted">记录 ProBoost 已登录浏览器中的邮件请求，自动筛出 list/detail/reply 候选接口。默认脱敏，不保存 cookies 或 auth headers。</p>
+      <div class="stats">
+        <span class="metric"><strong>${escapeHtml(latestRun?.candidateCount || 0)}</strong> 候选接口</span>
+        <span class="metric"><strong>${escapeHtml(latestRun?.requestCount || 0)}</strong> 请求</span>
+        <span class="metric"><strong>${escapeHtml(latestRun?.responseCount || 0)}</strong> 响应</span>
+        <span class="metric"><strong>${payload.running ? '1' : '0'}</strong> 运行中</span>
+      </div>
+    </div>
+    <form method="post" action="/mail-debug/run" class="debug-runner">
+      <div class="grid">
+        <div>
+          <label>邮箱</label>
+          <select name="mailbox">
+            <option value="replied">已回复</option>
+            <option value="inbox">收件箱</option>
+          </select>
+        </div>
+        <div>
+          <label>记录时长 ms</label>
+          <input name="duration" type="number" min="5000" step="1000" value="45000" />
+        </div>
+        <label class="row" style="align-self:end; margin:0">
+          <input name="openFirstRow" type="checkbox" value="1" />
+          打开第一封邮件
+        </label>
+      </div>
+      <p class="muted">需要捕获详情接口时勾选“打开第一封邮件”。真实发送不会在此页面触发。</p>
+      <p id="mail-debug-running" class="muted" ${payload.running ? '' : 'hidden'}>验收记录正在运行，页面会在任务结束后显示新产物。</p>
+      <button type="submit" ${payload.running ? 'disabled' : ''}>开始验收记录</button>
+      <button class="secondary" type="submit" formaction="/auth/login">登录状态入口</button>
+    </form>
+  </section>
+  ${latest ? `<section>
+    <h2>当前任务</h2>
+    <div class="stats">
+      <span class="metric"><strong>${escapeHtml(latest.status || '-')}</strong> 状态</span>
+      <span class="metric"><strong>${escapeHtml(latest.startedAt || '-')}</strong> 开始</span>
+    </div>
+    ${latest.error ? `<pre>${escapeHtml(latest.error)}</pre>` : ''}
+  </section>` : ''}
+  <section>
+    <h2>最新候选接口</h2>
+    ${topCandidates ? `<div class="batch-box debug-table"><table>
+      <thead><tr><th>方法</th><th>类型</th><th>状态</th><th>Content-Type</th><th>URL</th></tr></thead>
+      <tbody>${topCandidates}</tbody>
+    </table></div>` : '<p class="muted">还没有候选接口。先运行一次验收记录。</p>'}
+  </section>
+  <section>
+    <h2>验收产物</h2>
+    ${runRows ? `<div class="batch-box"><table>
+      <thead><tr><th>时间</th><th>候选</th><th>请求/响应</th><th>邮箱</th><th>Summary</th><th>Candidates</th></tr></thead>
+      <tbody>${runRows}</tbody>
+    </table></div>` : '<p class="muted">暂无产物。</p>'}
+  </section>
+  ${jobRows ? `<section>
+    <h2>最近任务</h2>
+    <div class="batch-box"><table>
+      <thead><tr><th>开始</th><th>状态</th><th>结束</th><th>结果/错误</th></tr></thead>
+      <tbody>${jobRows}</tbody>
+    </table></div>
+  </section>` : ''}`;
 }
 
 app.get('/', (_req, res) => {
@@ -840,6 +1003,10 @@ app.get('/', (_req, res) => {
 
 app.get('/api/followup-summary', (_req, res) => {
   res.json(followupSummaryPayload());
+});
+
+app.get('/api/mail-debug-summary', (_req, res) => {
+  res.json(mailDebugSummaryPayload());
 });
 
 app.get('/api/dashboard', (_req, res) => {
@@ -860,8 +1027,26 @@ app.get('/followup', (_req, res) => {
   res.send(page('二次触达 - ProBoost Creator CRM', renderInboxClassification(), 'followup'));
 });
 
+app.get('/mail-debug', (_req, res) => {
+  res.send(page('邮件验收 - ProBoost Creator CRM', renderMailDebugPage(), 'mail-debug'));
+});
+
 app.get('/dashboard', (_req, res) => {
   res.send(page('数据看板 - ProBoost Creator CRM', renderDashboard(), 'dashboard'));
+});
+
+app.get('/reports/artifact', (req, res, next) => {
+  try {
+    const filePath = resolveReportArtifact(req.query.path);
+    if (!filePath) {
+      res.status(404).send(page('产物不存在', '<section><h2>产物不存在或不在 reports 目录下</h2></section>', 'mail-debug'));
+      return;
+    }
+    res.type(path.extname(filePath) === '.json' ? 'application/json' : 'text/plain');
+    res.send(fs.readFileSync(filePath, 'utf8'));
+  } catch (error) {
+    next(error);
+  }
 });
 
 app.post('/upload', upload.array('files', 20), async (req, res, next) => {
@@ -999,6 +1184,34 @@ app.post('/auth/login', async (_req, res, next) => {
       task: () => loginInteractively({ keepOpen: false, headless: false }),
     });
     res.redirect(303, '/followup#inbox-classifier');
+  } catch (error) {
+    next(error);
+  }
+});
+
+function mailDebugOptionsFromBody(body) {
+  return {
+    mailbox: body.mailbox || 'replied',
+    duration: body.duration || '45000',
+    openFirstRow: body.openFirstRow === '1' || body.openFirstRow === 'on',
+    keepOpen: false,
+    headless: false,
+  };
+}
+
+app.post('/mail-debug/run', async (req, res, next) => {
+  try {
+    if (hasRunningJob('mail-debug')) {
+      res.redirect(303, '/mail-debug');
+      return;
+    }
+    const options = mailDebugOptionsFromBody(req.body);
+    startJob({
+      type: 'mail-debug',
+      templateName: `${options.mailbox} discovery`,
+      task: () => runMailApiDiscovery(options),
+    });
+    res.redirect(303, '/mail-debug');
   } catch (error) {
     next(error);
   }

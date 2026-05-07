@@ -1,10 +1,21 @@
 # Send-Mail SQLite Migration Plan
 
+## Current Status
+
+Status as of 2026-05-06:
+
+- Implemented: SQLite campaign/batch tables, manifest upsert, atomic batch claims, runner heartbeat, stale recovery, runtime SQLite status updates, repo-owned split logic, and repo-owned ProBoost send runtime.
+- Implemented for CRM-owned surfaces: `/api/dashboard`, `/api/send-work-orders`, dashboard/send React assets, and SQLite-backed work-order payloads.
+- Still compatible with legacy runner assumptions: `manifest.json`, `MANIFEST_PATH`, `BATCH_LIST`, and environment-variable task options are still used by `src/sendMailBridge/engine.js` and the runtime.
+- Next migration step: remove the manifest/env-var adapter contract from the runner internals and pass typed task options directly.
+
+The rest of this document preserves the phase plan and historical rationale.
+
 ## Problem
 
 The send-mail review UI currently treats `manifest.json` as the operational state store. The web server renders pages from manifest files, `src/sendMailBridge/engine.js` updates those files before spawning work, and `/Users/depp/send-mail/proboost-auto.js` also reads and writes the same files while processing batches.
 
-This leaves two structural problems:
+At the time this plan was written, this left two structural problems:
 
 - The HTML surface in `src/web/server.js` is still generated through large JavaScript template strings. `src/web/views/layout.js` only extracts the page shell, not the view layer.
 - `src/sendMailBridge/syncToCrm.js` mirrors manifest terminal states into `send_logs`, but it does not make SQLite the source of truth. Concurrent jobs can still race on the same manifest file.
@@ -128,6 +139,10 @@ Non-goals:
 - Do not rewrite all Playwright selectors in the same commit that removes manifest state.
 - Do not change ProBoost sending behavior and source-of-truth migration in one large step. Internalization should happen after SQLite state and recovery are stable.
 
-## First Implementation Step
+## Current Next Step
 
-This change implements Phase 1 only. After it lands, the current UI and automation still work, but every split/run has a normalized SQLite representation. That gives later phases a stable migration target without forcing a risky rewrite of the sending engine in one pass.
+Do not restart at Phase 1. The next useful work is to remove the remaining compatibility contract:
+
+1. Replace `MANIFEST_PATH` / `BATCH_LIST` runner configuration with typed task inputs.
+2. Keep a compatibility manifest only for debugging or remove it entirely if no runtime code needs it.
+3. Add smoke coverage around split, claim, heartbeat, zero-send handling, and a headed dry-run send path.

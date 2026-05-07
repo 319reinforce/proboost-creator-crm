@@ -691,6 +691,45 @@ async function tryConfirmSend(page) {
           return 'zero-send';
         }
 
+
+        if (isSendConfirmModal && /本次操作将发送0封邮件|发送0封邮件|将发送0封邮件/.test(modalText)) {
+          const cancelBtn = buttons.find(button => {
+            const text = normalize(button.innerText || button.textContent || '');
+            const disabled = button.disabled || button.getAttribute('aria-disabled') === 'true';
+            return !disabled && (text.includes('取消') || text.includes('关闭'));
+          });
+          const closeBtn = modal.querySelector('.ant-modal-close');
+          if (cancelBtn) cancelBtn.click();
+          else if (closeBtn) closeBtn.click();
+          return 'zero-send';
+        }
+
+
+        if (isSendConfirmModal && /本次操作将发送0封邮件|发送0封邮件|将发送0封邮件/.test(modalText)) {
+          const cancelBtn = buttons.find(button => {
+            const text = normalize(button.innerText || button.textContent || '');
+            const disabled = button.disabled || button.getAttribute('aria-disabled') === 'true';
+            return !disabled && (text.includes('取消') || text.includes('关闭'));
+          });
+          const closeBtn = modal.querySelector('.ant-modal-close');
+          if (cancelBtn) cancelBtn.click();
+          else if (closeBtn) closeBtn.click();
+          return 'zero-send';
+        }
+
+
+        if (isSendConfirmModal && /本次操作将发送0封邮件|发送0封邮件|将发送0封邮件/.test(modalText)) {
+          const cancelBtn = buttons.find(button => {
+            const text = normalize(button.innerText || button.textContent || '');
+            const disabled = button.disabled || button.getAttribute('aria-disabled') === 'true';
+            return !disabled && (text.includes('取消') || text.includes('关闭'));
+          });
+          const closeBtn = modal.querySelector('.ant-modal-close');
+          if (cancelBtn) cancelBtn.click();
+          else if (closeBtn) closeBtn.click();
+          return 'zero-send';
+        }
+
         const primaryBtn = buttons.find(button =>
           button.classList.contains('ant-btn-primary')
           && !button.disabled
@@ -1250,6 +1289,54 @@ async function main() {
         // 某些场景确认弹窗会延后渲染，这里再补一次重试
         await page.waitForTimeout(1200);
         confirmed = await tryConfirmSend(page);
+      }
+      if (confirmed === 'zero-send') {
+        console.log('  ℹ️ 确认发送弹窗显示本次将发送 0 封邮件，已关闭弹窗并跳过本批次。');
+        await clearFreshSuccessSignal(page);
+        updateManifestStatusForBatch(currentBatch, 'sent', {
+          inputFile,
+          sentAt: new Date().toISOString(),
+          selectedCount: 0,
+          skipped: true,
+          reason: 'send-confirm-zero',
+        });
+        const appended = appendPendingBatchesAfterCurrent(batchNumbers, currentBatch);
+        if (appended.length > 0) {
+          console.log(`ℹ️ 当前批次已跳过，自动继续后续待处理批次: [${appended.join(', ')}]`);
+        }
+        continue;
+      }
+      if (confirmed === 'zero-send') {
+        console.log('  ℹ️ 确认发送弹窗显示本次将发送 0 封邮件，已关闭弹窗并跳过本批次。');
+        await clearFreshSuccessSignal(page);
+        updateManifestStatusForBatch(currentBatch, 'sent', {
+          inputFile,
+          sentAt: new Date().toISOString(),
+          selectedCount: 0,
+          skipped: true,
+          reason: 'send-confirm-zero',
+        });
+        const appended = appendPendingBatchesAfterCurrent(batchNumbers, currentBatch);
+        if (appended.length > 0) {
+          console.log(`ℹ️ 当前批次已跳过，自动继续后续待处理批次: [${appended.join(', ')}]`);
+        }
+        continue;
+      }
+      if (confirmed === 'zero-send') {
+        console.log('  ℹ️ 确认发送弹窗显示本次将发送 0 封邮件，已关闭弹窗并跳过本批次。');
+        await clearFreshSuccessSignal(page);
+        updateManifestStatusForBatch(currentBatch, 'sent', {
+          inputFile,
+          sentAt: new Date().toISOString(),
+          selectedCount: 0,
+          skipped: true,
+          reason: 'send-confirm-zero',
+        });
+        const appended = appendPendingBatchesAfterCurrent(batchNumbers, currentBatch);
+        if (appended.length > 0) {
+          console.log(`ℹ️ 当前批次已跳过，自动继续后续待处理批次: [${appended.join(', ')}]`);
+        }
+        continue;
       }
       if (confirmed === 'zero-send') {
         console.log('  ℹ️ 确认发送弹窗显示本次将发送 0 封邮件，已关闭弹窗并跳过本批次。');

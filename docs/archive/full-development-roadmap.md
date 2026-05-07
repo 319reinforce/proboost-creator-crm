@@ -1,5 +1,7 @@
 # ProBoost Creator CRM 完整开发方案
 
+> Archived reference. This was an early broad roadmap. For current status and next steps, start with `docs/README.md` and `docs/handoff.md`.
+
 ## 1. 项目定位
 
 当前 `proboost-ready-reminder` 已经验证了一个关键闭环：

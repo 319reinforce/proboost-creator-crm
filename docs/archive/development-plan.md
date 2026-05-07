@@ -1,5 +1,7 @@
 # ProBoost Creator CRM Development Plan
 
+> Archived reference. This was an early layer plan. For current status and next steps, start with `docs/README.md` and `docs/handoff.md`.
+
 This project is built in layers. Each layer should be usable on its own before the next one starts.
 
 ## Layer 1: Stable CLI

@@ -171,7 +171,7 @@ function DataTable({ rows }) {
   );
 }
 
-function BatchTable({ batches }) {
+function BatchTable({ batches, manifestPath, templateName, disabled }) {
   if (!batches.length) return <p className="empty-text">这个工单还没有批次记录。</p>;
   return (
     <div className="table-shell">
@@ -185,20 +185,37 @@ function BatchTable({ batches }) {
             <th>状态</th>
             <th>原因</th>
             <th>心跳</th>
+            <th>操作</th>
           </tr>
         </thead>
         <tbody>
-          {batches.map(batch => (
-            <tr key={batch.id || batch.batchNumber}>
-              <td>{batch.batchNumber}</td>
-              <td>{batch.fileName || '-'}</td>
-              <td>{formatNumber(batch.rowCount)}</td>
-              <td>{batch.selectedCount == null ? '-' : formatNumber(batch.selectedCount)}</td>
-              <td><StatusPill status={batch.status}>{batch.label || statusLabel(batch.status)}</StatusPill></td>
-              <td>{batch.reason || '-'}</td>
-              <td>{batch.lastHeartbeatAt || '-'}</td>
-            </tr>
-          ))}
+          {batches.map(batch => {
+            const canRetry = batch.status === 'failed' && batch.reason !== 'success-toast-not-found';
+            return (
+              <tr key={batch.id || batch.batchNumber}>
+                <td>{batch.batchNumber}</td>
+                <td>{batch.fileName || '-'}</td>
+                <td>{formatNumber(batch.rowCount)}</td>
+                <td>{batch.selectedCount == null ? '-' : formatNumber(batch.selectedCount)}</td>
+                <td><StatusPill status={batch.status}>{batch.label || statusLabel(batch.status)}</StatusPill></td>
+                <td>{batch.reason || '-'}</td>
+                <td>{batch.lastHeartbeatAt || '-'}</td>
+                <td>
+                  {canRetry ? (
+                    <form className="batch-action-form" method="post" action="/batch/send">
+                      <input type="hidden" name="manifestPath" value={manifestPath || ''} />
+                      <input type="hidden" name="batchNumber" value={batch.batchNumber} />
+                      <input type="hidden" name="templateName" value={templateName || '0414新规模板'} />
+                      <button className="icon-action danger-action" type="submit" disabled={!manifestPath || disabled}>
+                        <Send size={14} />
+                        发送
+                      </button>
+                    </form>
+                  ) : '-'}
+                </td>
+              </tr>
+            );
+          })}
         </tbody>
       </table>
     </div>
@@ -208,6 +225,7 @@ function BatchTable({ batches }) {
 function WorkOrderCard({ order }) {
   const summary = order.summary || {};
   const hasActiveJob = (order.activeJobs || []).length > 0;
+  const [templateName, setTemplateName] = useState('0414新规模板');
 
   return (
     <section className="dashboard-band work-order-card">
@@ -227,7 +245,12 @@ function WorkOrderCard({ order }) {
           <input type="hidden" name="manifestPath" value={order.rawManifestPath || ''} />
           <label>
             <span>模板</span>
-            <input name="templateName" list="template-options" defaultValue="0414新规模板" />
+            <input
+              name="templateName"
+              list="template-options"
+              value={templateName}
+              onChange={event => setTemplateName(event.target.value)}
+            />
           </label>
           <button className="refresh-button danger-action" type="submit" disabled={!order.rawManifestPath || hasActiveJob}>
             <Send size={16} />
@@ -256,7 +279,12 @@ function WorkOrderCard({ order }) {
 
       <details className="batch-details">
         <summary>查看批次明细</summary>
-        <BatchTable batches={order.batches || []} />
+        <BatchTable
+          batches={order.batches || []}
+          manifestPath={order.rawManifestPath}
+          templateName={templateName}
+          disabled={hasActiveJob}
+        />
       </details>
     </section>
   );

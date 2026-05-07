@@ -1,4 +1,3 @@
-const crypto = require('crypto');
 const { launchProBoostSession, persistAuthSnapshot } = require('./session');
 const {
   searchInboxByHandle,
@@ -17,10 +16,9 @@ const { listUnusedInvites } = require('../importer/queries');
 const { getActiveTemplate, renderTemplate } = require('../templates/render');
 const {
   insertSendLog,
-  upsertMailThread,
-  insertMailMessage,
   insertAnalysisResult,
 } = require('../db');
+const { persistThreadRead } = require('./mailSyncPersistence');
 const { classifyInboxReplyWithOptionalLlm } = require('../classifier/llmClassifier');
 const config = require('../config');
 
@@ -83,59 +81,6 @@ function renderFollowup(template, variables) {
   if (!template) return null;
   const rendered = renderTemplate(template, variables);
   return rendered.ok ? rendered : null;
-}
-
-function stableHash(parts) {
-  return crypto
-    .createHash('sha256')
-    .update(parts.map(item => String(item || '').trim()).join('\n'))
-    .digest('hex')
-    .slice(0, 32);
-}
-
-function deriveThreadKey({ page, row, threadText }) {
-  const currentUrl = page?.url?.() || '';
-  try {
-    const parsed = new URL(currentUrl);
-    const stableKeys = ['threadId', 'thread_id', 'mailId', 'mail_id', 'messageId', 'message_id', 'id'];
-    for (const key of stableKeys) {
-      const value = parsed.searchParams.get(key);
-      if (value) return `url:${parsed.origin}${parsed.pathname}?${key}=${value}`;
-    }
-    if (parsed.hash && /id|thread|mail|message/i.test(parsed.hash)) {
-      return `url:${parsed.origin}${parsed.pathname}${parsed.hash}`;
-    }
-  } catch {
-    // Fall through to deterministic row/thread hashes.
-  }
-
-  if (row?.sender || row?.subject || row?.time) {
-    return `row:${stableHash([row.sender, row.subject, row.time])}`;
-  }
-  return `text:${stableHash([row?.sender, row?.subject, String(threadText || '').slice(0, 500)])}`;
-}
-
-function persistThreadRead(db, { page, row, threadText }) {
-  const providerThreadId = deriveThreadKey({ page, row, threadText });
-  const now = new Date().toISOString();
-  const threadRecord = upsertMailThread(db, {
-    provider_thread_id: providerThreadId,
-    mailbox: 'inbox',
-    sender: row.sender,
-    subject: row.subject,
-    first_message_at: row.time,
-    last_message_at: now,
-    last_synced_at: now,
-  });
-  const messageRecord = insertMailMessage(db, {
-    thread_id: threadRecord.id,
-    direction: 'inbound',
-    subject: row.subject,
-    sender: row.sender,
-    body_text: threadText,
-    received_at: row.time,
-  });
-  return { threadRecord, messageRecord, providerThreadId };
 }
 
 function persistClassification(db, { messageRecord, classification }) {

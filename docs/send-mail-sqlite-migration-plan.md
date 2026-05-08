@@ -4,10 +4,27 @@
 
 Status as of 2026-05-06:
 
-- Implemented: SQLite campaign/batch tables, manifest upsert, atomic batch claims, runner heartbeat, stale recovery, runtime SQLite status updates, repo-owned split logic, and repo-owned ProBoost send runtime.
+- Implemented: SQLite campaign/batch tables, manifest upsert, atomic batch claims, explicit failed-batch retry, runner heartbeat, stale recovery, runtime SQLite status updates, repo-owned split logic, and repo-owned ProBoost send runtime.
 - Implemented for CRM-owned surfaces: `/api/dashboard`, `/api/send-work-orders`, dashboard/send React assets, and SQLite-backed work-order payloads.
 - Still compatible with legacy runner assumptions: `manifest.json`, `MANIFEST_PATH`, `BATCH_LIST`, and environment-variable task options are still used by `src/sendMailBridge/engine.js` and the runtime.
 - Next migration step: remove the manifest/env-var adapter contract from the runner internals and pass typed task options directly.
+
+## Failed Batch Retry Compatibility
+
+Status as of 2026-05-08: compatible with the current send-mail state model.
+
+The failed work-order retry feature is intentionally narrow:
+
+- Single batch retry uses `/batch/send`, which calls `runBatch()`.
+- `runBatch()` claims through `claimSendMailBatch()`.
+- `claimSendMailBatch()` allows `pending` and hard `failed` rows, but excludes `failed` rows whose reason is `success-toast-not-found`. A hard failed batch can move back to `sending` or `preparing` with a fresh `task_run_id`, `claimed_at`, heartbeat, and incremented `attempt_count`.
+- Bulk pending send still uses `claimPendingSendMailBatches()`, which selects only `status = 'pending'`. This avoids silently sweeping failed rows into a bulk retry.
+- The React `/send` table exposes retry only when `batch.status === 'failed' && batch.reason !== 'success-toast-not-found'`.
+- The DB claim enforces the same rule, so a direct POST to `/batch/send` cannot bypass the UI guard for verification-missed sends.
+
+This is compatible with the Phase 3 claim/recovery model and with the Phase 5 CRM-owned SQLite surfaces. It does not touch the mail-sync tables added for replied-mail Phase 5.
+
+Important safety rule: `success-toast-not-found` is a verification miss, not a proven send failure. It is normalized elsewhere as `send-confirmed-verify-missed` and must remain manual-review-only until a reliable sent-mail verification path is added.
 
 The rest of this document preserves the phase plan and historical rationale.
 
@@ -88,6 +105,7 @@ Deliverables:
 - On web server startup, mark in-memory task runs that were left `running` as failed and run the stale batch recovery once.
 - Make `/batch/send-pending` claim the next set from SQLite, not from manifest contents.
 - Reject or skip already claimed batches.
+- Allow explicit single-batch retry for hard `failed` rows, while keeping bulk pending send limited to `pending`.
 
 ### Phase 4: Legacy Automation Adapter
 
@@ -113,6 +131,7 @@ Deliverables:
 - Stop generating `manifest.json` during split, or generate only a temporary compatibility file.
 - Delete manifest scanning from CRM code.
 - Update docs and runbooks to describe SQLite as the source of truth.
+- Keep failed-batch retry driven by SQLite batch status. Do not reintroduce manifest-only retry state.
 
 ### Phase 6: Decouple and Internalize Legacy Logic
 
@@ -145,4 +164,4 @@ Do not restart at Phase 1. The next useful work is to remove the remaining compa
 
 1. Replace `MANIFEST_PATH` / `BATCH_LIST` runner configuration with typed task inputs.
 2. Keep a compatibility manifest only for debugging or remove it entirely if no runtime code needs it.
-3. Add smoke coverage around split, claim, heartbeat, zero-send handling, and a headed dry-run send path.
+3. Add smoke coverage around split, claim, heartbeat, failed-batch retry, zero-send handling, and a headed dry-run send path.

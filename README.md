@@ -4,6 +4,7 @@
 
 Agent handoff rule: future coding agents must read `docs/agent-git-workflow.md` before editing. Use GitHub as the remote and create a new working branch before every code change. Start with `docs/README.md` for the current documentation map. For followup automation work, read `docs/mail-sync-followup-development-plan.md`; `docs/followup-optimization-plan.md` is retained as historical context.
 For send-mail batch-state migration work, read `docs/send-mail-sqlite-migration-plan.md`.
+For continuing the next implementation phases, start with `docs/next-agent-phase-kickoff.md`.
 
 It turns one-off reminder scripts into a structured workflow:
 
@@ -73,6 +74,7 @@ Implemented:
 - send log persistence
 - SQLite-backed send-mail campaigns and batches
 - atomic batch claims, runner heartbeat, and stale-run recovery
+- explicit retry for hard-failed send-mail batches from the SQLite-backed work-order UI
 - React/Vite operator assets for dashboard and send-work-order views
 - project-owned send-mail split logic and ProBoost runtime script under `src/sendMailBridge/`
 
@@ -82,6 +84,7 @@ Current gaps:
 - Standalone `mail-sync` exists for browser-backed body sync into SQLite.
 - Standalone `mail-debug` and the `/mail-debug` acceptance page exist for sanitized ProBoost mail API discovery.
 - Mail sync DB idempotency exists: repeated syncs dedupe `mail_messages` by generated provider message id or body hash, and thread sync status/errors are queryable.
+- Phase 4 captured inbox rows were cross-checked locally against Phase 5 identity rules; API message ids are better than DOM row hashes.
 - Actual registered-list import needs its own recurring operator flow; the existing initial `--ready` import is not enough for the real second-touch funnel.
 - DB-backed `classify-mail` is still planned.
 - Send-mail still writes compatibility manifests and passes runner options through environment variables.

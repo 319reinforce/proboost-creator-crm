@@ -8,7 +8,8 @@ This folder is split into current operating documents and archived planning note
 - `handoff.md`: current implementation status and next engineering steps.
 - `send-mail-sqlite-migration-plan.md`: send-mail state migration status. SQLite is now the CRM source of truth for campaigns, batches, task runs, and recovery; manifest files remain compatibility artifacts for the current runner contract.
 - `mail-sync-followup-development-plan.md`: next development plan for replied-mail sync, detail opening, API discovery, DB-backed classification, and DB-backed ready followup.
-- `mail-sync-phase4-handoff.md`: implementation handoff for mail-sync phases 0-4, including verification gaps and risks.
+- `mail-sync-phase4-handoff.md`: implementation handoff for mail-sync phases 0-5, including verification gaps and risks.
+- `next-agent-phase-kickoff.md`: start-here execution brief for the next agent that should continue all remaining phases.
 - `followup-optimization-plan.md`: historical followup implementation plan with useful context. For new mail-sync work, use `mail-sync-followup-development-plan.md` as the active plan.
 
 ## Archived Reference
@@ -23,7 +24,7 @@ The files in `archive/` are preserved for background only. They describe earlier
 
 ### Send-Mail
 
-- Done: SQLite landing zone, batch claims, heartbeat/recovery, runtime SQLite updates, React/Vite asset bundle, and repo-owned split/send runtime entrypoints.
+- Done: SQLite landing zone, batch claims, heartbeat/recovery, failed-batch single retry, runtime SQLite updates, React/Vite asset bundle, and repo-owned split/send runtime entrypoints.
 - Compatibility remaining: `manifest.json`, `MANIFEST_PATH`, `BATCH_LIST`, and environment-variable runner options are still used as adapter inputs.
 - Next: remove the manifest/env-var compatibility contract from the send runner internals and add headed smoke coverage.
 

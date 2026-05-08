@@ -588,7 +588,13 @@ function claimSendMailBatch(db, { manifestPath, batchNumber, taskRunId, claimedB
         updated_at = CURRENT_TIMESTAMP
     WHERE send_mail_campaign_id = @campaign_id
       AND batch_number = @batch_number
-      AND status IN ('pending', 'failed')
+      AND (
+        status = 'pending'
+        OR (
+          status = 'failed'
+          AND COALESCE(reason, '') != 'success-toast-not-found'
+        )
+      )
   `).run({
     status,
     task_run_id: taskRunId || null,

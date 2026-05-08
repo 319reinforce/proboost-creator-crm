@@ -2,7 +2,7 @@
 
 `proboost-creator-crm` is the next-stage CRM project for ProBoost creator operations.
 
-Agent handoff rule: future coding agents must read `docs/agent-git-workflow.md` before editing. Use GitHub as the remote and create a new working branch before every code change. For followup automation work, also read `docs/followup-optimization-plan.md`.
+Agent handoff rule: future coding agents must read `docs/agent-git-workflow.md` before editing. Use GitHub as the remote and create a new working branch before every code change. Start with `docs/README.md` for the current documentation map. For followup automation work, read `docs/mail-sync-followup-development-plan.md`; `docs/followup-optimization-plan.md` is retained as historical context.
 For send-mail batch-state migration work, read `docs/send-mail-sqlite-migration-plan.md`.
 
 It turns one-off reminder scripts into a structured workflow:
@@ -55,12 +55,13 @@ npm run report -- --campaign 2026-04-28
 
 ## Current Layer
 
-This first layer is a Stable CLI foundation. It intentionally does not send real emails yet.
+The project is now beyond the first CLI layer. It has a SQLite-backed operations ledger, browser automation adapters, a local web console, and repo-owned batch split/send runtime code. Real sends remain explicit and headed.
 
 Implemented:
 
 - SQLite schema
 - push/ready import from text or CSV-style files
+- `.xlsx` upload and split for send-mail batches
 - creator and invite-code upsert
 - unused invite query
 - template variable rendering
@@ -70,15 +71,20 @@ Implemented:
 - reminder dry-run / send CLI
 - ready-reply classification and second-touch follow-up CLI
 - send log persistence
+- SQLite-backed send-mail campaigns and batches
+- atomic batch claims, runner heartbeat, and stale-run recovery
+- React/Vite operator assets for dashboard and send-work-order views
+- project-owned send-mail split logic and ProBoost runtime script under `src/sendMailBridge/`
 
-Excel import is intentionally deferred because the common `xlsx` package currently has unresolved advisories. Export sheets to CSV/text for Layer 1.
+Current gaps:
 
-Next layers:
-
-- inbox sync and reply registration
-- semantic classification
-- manual review queue
-- web operator console
+- `ready-followup` still syncs, classifies, and prepares/sends in one live browser pass.
+- Standalone `mail-sync` exists for browser-backed body sync into SQLite.
+- Standalone `mail-debug` and the `/mail-debug` acceptance page exist for sanitized ProBoost mail API discovery.
+- Mail sync DB idempotency exists: repeated syncs dedupe `mail_messages` by generated provider message id or body hash, and thread sync status/errors are queryable.
+- Actual registered-list import needs its own recurring operator flow; the existing initial `--ready` import is not enough for the real second-touch funnel.
+- DB-backed `classify-mail` is still planned.
+- Send-mail still writes compatibility manifests and passes runner options through environment variables.
 
 ## Automation Commands
 
@@ -140,7 +146,7 @@ Every attempt writes a row to `send_logs`.
 
 ## Send-Mail Review UI
 
-The project also integrates the mature batch-send workflow from `/Users/depp/send-mail`.
+The project includes a repo-owned batch-send workflow derived from the mature `/Users/depp/send-mail` scripts. Treat `/Users/depp/send-mail` as read-only reference unless explicitly asked otherwise.
 
 Start the local review UI:
 
@@ -159,15 +165,15 @@ Workflow:
 1. Select one or more local `.xlsx` creator files.
 2. Choose a batch size.
 3. Upload and split into batch files.
-4. Review generated batches in the page.
+4. Review generated batches in the page. The CRM stores campaigns and batches in SQLite.
 5. Fill the ProBoost template name for the batch.
 6. Click `有头发送` for a single batch, or `连续有头发送 pending` for all pending batches.
 
 Notes:
 
-- All ProBoost publishing uses headed Microsoft Edge through the existing `send-mail/proboost-auto.js` engine.
+- All ProBoost publishing uses headed Microsoft Edge through the project-owned runtime in `src/sendMailBridge/runtime/`.
 - Template names are passed through to ProBoost as `TEMPLATE_NAME`. Common values are `0414新规模板` and `0421三图模板`, and the field also accepts custom template names.
-- Sent-mail data is not copied into CRM storage.
+- Batch send status is stored in SQLite. Terminal results are also synced into CRM-visible logs where available.
 - The ProBoost sent-mail page is only used by the underlying browser workflow when verification is explicitly enabled.
-- Batch status is stored only in each generated `manifest.json`.
-- Migration away from manifest-owned batch state is planned in `docs/send-mail-sqlite-migration-plan.md`; Phase 1 mirrors split/run state into SQLite while preserving the legacy workflow.
+- Compatibility `manifest.json` files may still be generated for the current runner contract, but they are not the CRM source of truth.
+- The remaining migration work is tracked in `docs/send-mail-sqlite-migration-plan.md`.

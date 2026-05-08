@@ -27,6 +27,7 @@ module.exports = {
   dbPath: path.resolve(rootDir, process.env.CRM_DB_PATH || 'data/proboost-creator-crm.sqlite'),
   reportDir: path.resolve(rootDir, process.env.REPORT_DIR || 'reports'),
   proboostUrl: process.env.PROBOOST_URL || 'https://mail.proboost.microdata-inc.com/mail',
+  repliedUrl: process.env.REPLIED_URL || '',
   sentUrl: process.env.SENT_URL || 'https://mail.proboost.microdata-inc.com/mail/sent',
   auth,
   pageSize: Number(process.env.PAGE_SIZE || 100),

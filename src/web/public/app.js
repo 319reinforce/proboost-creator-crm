@@ -101,7 +101,7 @@
       <td><span class="status ${escapeHtml(statusClass(job.status))}">${escapeHtml(job.status || '-')}</span></td>
       <td>${escapeHtml(job.templateName || '-')}</td>
       <td>${escapeHtml(job.finishedAt || '-')}</td>
-      <td>${job.error ? `<details><summary>错误</summary><pre>${escapeHtml(job.error)}</pre></details>` : escapeHtml(job.runId || '-')}</td>
+      <td>${job.error ? `<details><summary>错误</summary>${(job.diagnostics || []).length ? `<div class="muted">诊断 JSON：${(job.diagnostics || []).map(item => `<code>${escapeHtml(item)}</code>`).join(' ')}</div>` : ''}<pre>${escapeHtml(job.error)}</pre></details>` : escapeHtml(job.runId || '-')}</td>
     </tr>`);
   }
 
@@ -135,9 +135,26 @@
       error.hidden = !latest.error;
       error.textContent = latest.error || '';
     }
+    const diagnostics = document.getElementById('followup-diagnostics');
+    if (diagnostics) {
+      const taskDiagnostics = (payload.tasks || []).flatMap(item => item.diagnostics || []);
+      diagnostics.innerHTML = taskDiagnostics.length
+        ? `<div class="muted">诊断 JSON：${[...new Set(taskDiagnostics)].map(item => `<code>${escapeHtml(item)}</code>`).join(' ')}</div>`
+        : '';
+    }
 
     renderResultRows(payload.rows || []);
     renderTaskRows(payload.tasks || []);
+  }
+
+  async function refreshMailDebug() {
+    const root = document.getElementById('mail-debug-root');
+    if (!root) return;
+    const response = await fetch('/api/mail-debug-summary', { headers: { Accept: 'application/json' } });
+    if (!response.ok) return;
+    const payload = await response.json();
+    const running = document.getElementById('mail-debug-running');
+    if (running) running.hidden = !payload.running;
   }
 
   document.addEventListener('submit', event => {
@@ -155,6 +172,7 @@
     try {
       const payload = JSON.parse(event.data);
       if (payload.type === 'ready-followup') refreshFollowup();
+      if (payload.type === 'mail-debug') refreshMailDebug();
     } catch {
       // Ignore malformed event payloads; explicit refresh still works.
     }

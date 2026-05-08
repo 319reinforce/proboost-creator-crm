@@ -32,6 +32,8 @@ const SELECTORS = {
   },
   repliedStatus: {
     text: '已回复',
+    candidates: ['已回复', '已回信', '已收到回复', '回复'],
+    fuzzyContains: '回复',
     variants: [
       '.ant-select',
       '.ant-select-selector',

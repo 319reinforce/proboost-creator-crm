@@ -12,6 +12,7 @@ function page(title, body, activeTab = 'send') {
   const tabs = [
     { key: 'send', label: '发信', href: '/send' },
     { key: 'followup', label: '二次触达', href: '/followup' },
+    { key: 'mail-debug', label: '邮件验收', href: '/mail-debug' },
     { key: 'dashboard', label: '数据看板', href: '/dashboard' },
   ];
 

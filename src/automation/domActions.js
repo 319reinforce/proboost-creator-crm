@@ -29,7 +29,7 @@ function selectorList(selectors) {
 
 function summarizeDomFailure(payload) {
   const text = normalizeText(payload.bodyTextPreview).slice(0, 260);
-  return `feature=${payload.feature}; url=${payload.url || ''}; screenshot=${payload.screenshotPath || 'none'}; text=${text}`;
+  return `feature=${payload.feature}; url=${payload.url || ''}; screenshot=${payload.screenshotPath || 'none'}; diagnostic=${payload.jsonPath || 'none'}; text=${text}`;
 }
 
 async function clickVisibleExactText(page, label, selectors = 'button, [role="button"], a, div, span') {
@@ -129,6 +129,8 @@ async function extractMailRows(page) {
           sender: (cells[1]?.innerText || cells[1]?.textContent || '').trim(),
           subject: (cells[2]?.innerText || cells[2]?.textContent || '').trim(),
           time: (cells[3]?.innerText || cells[3]?.textContent || '').trim(),
+          status: (cells[4]?.innerText || cells[4]?.textContent || '').trim(),
+          text: (row.innerText || row.textContent || '').trim().slice(0, 500),
         };
       }
       return null;
@@ -244,23 +246,155 @@ async function robustOpenMailRow(page, rowIndex, options = {}) {
   return clicked;
 }
 
+async function getMailRowSnapshot(page, rowIndex, options = {}) {
+  return await page.evaluate(({ idx, requiredText, selectors, cellOrder }) => {
+    const isVisible = element => {
+      if (!element) return false;
+      const style = window.getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return style.display !== 'none'
+        && style.visibility !== 'hidden'
+        && style.opacity !== '0'
+        && rect.width > 0
+        && rect.height > 0;
+    };
+    const center = element => {
+      const rect = element.getBoundingClientRect();
+      return {
+        x: rect.left + rect.width / 2,
+        y: rect.top + rect.height / 2,
+        rect: {
+          x: rect.left,
+          y: rect.top,
+          width: rect.width,
+          height: rect.height,
+        },
+      };
+    };
+    const tables = Array.from(document.querySelectorAll(selectors));
+    const table = tables.find(item => {
+      const text = item.innerText || item.textContent || '';
+      return requiredText.every(label => text.includes(label));
+    });
+    if (!table) return null;
+    const rows = Array.from(table.querySelectorAll('tbody tr, .ant-table-tbody .ant-table-row'))
+      .filter(row => !row.classList.contains('ant-table-placeholder') && isVisible(row));
+    const row = rows[idx];
+    if (!row) return null;
+    row.scrollIntoView({ block: 'center', inline: 'nearest' });
+    const cells = Array.from(row.querySelectorAll('td, .ant-table-cell'));
+    let target = null;
+    for (const cellIndex of cellOrder || [1, 2, 0]) {
+      const cell = cells[cellIndex];
+      if (!cell) continue;
+      target = cell.querySelector('.cursor-pointer, .inbox-mail-receiving-tit, a, [role="button"], span, div') || cell;
+      if (target && isVisible(target)) break;
+    }
+    target = target && isVisible(target) ? target : row;
+    const clickableAncestor = target.closest('a[href], [role="button"], button, [data-row-key], [data-id], [data-testid], .cursor-pointer, [style*="cursor: pointer"]');
+    const href = row.querySelector('a[href]')?.href || target.closest('a[href]')?.href || '';
+    return {
+      rowIndex: idx,
+      rowText: (row.innerText || row.textContent || '').trim().slice(0, 1200),
+      rowHtml: row.outerHTML.slice(0, 5000),
+      href,
+      rowCenter: center(row),
+      targetCenter: center(target),
+      ancestorCenter: clickableAncestor ? center(clickableAncestor) : null,
+      url: window.location.href,
+    };
+  }, {
+    idx: rowIndex,
+    requiredText: options.requiredText || SELECTORS.mailTable.requiredText,
+    selectors: selectorList(options.selectors || SELECTORS.mailTable.variants),
+    cellOrder: options.cellOrder || [1, 2, 0],
+  }).catch(() => null);
+}
+
+async function openMailRowWithStrategy(page, rowIndex, strategy, options = {}) {
+  const snapshot = await getMailRowSnapshot(page, rowIndex, options);
+  if (!snapshot) return { ok: false, strategy, reason: 'row-not-found' };
+
+  if (strategy === 'dom-known-cell') {
+    const ok = await robustOpenMailRow(page, rowIndex, {
+      cellOrders: [options.cellOrder || [1, 2], [2, 1], [0, 1, 2]],
+      waitAfterMs: options.waitAfterMs || 1200,
+    });
+    return { ok, strategy, snapshot };
+  }
+
+  if (strategy === 'mouse-cell-center') {
+    await page.mouse.click(snapshot.targetCenter.x, snapshot.targetCenter.y);
+    await page.waitForTimeout(options.waitAfterMs || 1200);
+    return { ok: true, strategy, snapshot };
+  }
+
+  if (strategy === 'double-click-row-center') {
+    await page.mouse.click(snapshot.rowCenter.x, snapshot.rowCenter.y, { clickCount: 2 });
+    await page.waitForTimeout(options.waitAfterMs || 1200);
+    return { ok: true, strategy, snapshot };
+  }
+
+  if (strategy === 'focus-enter') {
+    const focused = await page.evaluate((idx) => {
+      const rows = Array.from(document.querySelectorAll('table tbody tr, .ant-table-tbody .ant-table-row'))
+        .filter(row => !row.classList.contains('ant-table-placeholder'));
+      const row = rows[idx];
+      if (!row) return false;
+      row.scrollIntoView({ block: 'center', inline: 'nearest' });
+      if (!row.hasAttribute('tabindex')) row.setAttribute('tabindex', '0');
+      row.focus();
+      return document.activeElement === row;
+    }, rowIndex).catch(() => false);
+    if (!focused) return { ok: false, strategy, reason: 'row-focus-failed', snapshot };
+    await page.keyboard.press('Enter').catch(() => {});
+    await page.waitForTimeout(options.waitAfterMs || 1200);
+    return { ok: true, strategy, snapshot };
+  }
+
+  if (strategy === 'click-pointer-ancestor') {
+    if (!snapshot.ancestorCenter) return { ok: false, strategy, reason: 'clickable-ancestor-not-found', snapshot };
+    await page.mouse.click(snapshot.ancestorCenter.x, snapshot.ancestorCenter.y);
+    await page.waitForTimeout(options.waitAfterMs || 1200);
+    return { ok: true, strategy, snapshot };
+  }
+
+  if (strategy === 'href-navigate') {
+    if (!snapshot.href) return { ok: false, strategy, reason: 'href-not-found', snapshot };
+    await page.goto(snapshot.href, { waitUntil: 'domcontentloaded', timeout: config.pageLoadTimeout });
+    await page.waitForTimeout(options.waitAfterMs || 1200);
+    return { ok: true, strategy, snapshot };
+  }
+
+  return { ok: false, strategy, reason: 'unknown-strategy', snapshot };
+}
+
 async function waitForMailDetail(page, row = {}, options = {}) {
   const timeout = options.timeout || 12000;
-  return await page.waitForFunction(({ expected, replyTexts }) => {
+  const startUrl = options.startUrl || page.url();
+  return await page.waitForFunction(({ expected, replyTexts, startUrl }) => {
     const normalize = value => String(value || '').replace(/\s+/g, ' ').trim();
     const text = document.body?.innerText || '';
+    const urlChanged = window.location.href !== startUrl;
+    const detailLikeUrl = /detail|thread|mailId|mail_id|messageId|message_id|threadId|thread_id|id=/i.test(window.location.href);
+    const hasBodyContainer = Boolean(document.querySelector('.mail-detail, [class*="mail-detail"], [class*="detail"], .ql-editor, [contenteditable="true"]'));
+    const hasReplyControl = Array.from(document.querySelectorAll('button, [role="button"], a')).some(element => {
+      const label = normalize(element.innerText || element.textContent || '');
+      return replyTexts.includes(label);
+    });
     const hasDetailChrome = text.includes('邮件详情')
       || text.includes('返回收件箱')
-      || Array.from(document.querySelectorAll('button, [role="button"], a')).some(element => {
-        const label = normalize(element.innerText || element.textContent || '');
-        return replyTexts.includes(label);
-      });
+      || hasReplyControl;
     const senderOk = !expected.sender || text.includes(expected.sender);
     const subjectOk = !expected.subject || text.includes(String(expected.subject).slice(0, 20));
-    return hasDetailChrome && senderOk && subjectOk;
+    const rowIdentityOk = senderOk && subjectOk;
+    return (hasDetailChrome && rowIdentityOk)
+      || (urlChanged && detailLikeUrl && rowIdentityOk)
+      || (hasBodyContainer && hasReplyControl && rowIdentityOk);
   }, {
     expected: row,
     replyTexts: SELECTORS.replyButton.texts,
+    startUrl,
   }, { timeout }).then(() => true).catch(() => false);
 }
 
@@ -279,27 +413,85 @@ async function captureDomFailure(page, feature, metadata = {}) {
     savedScreenshotPath = '';
   }
 
-  const preview = await page.evaluate(() => ({
-    url: window.location.href,
-    bodyTextPreview: (document.body?.innerText || '').slice(0, 1200),
-  })).catch(error => ({
+  const preview = await page.evaluate(() => {
+    const normalize = value => String(value || '').replace(/\s+/g, ' ').trim();
+    const visible = element => {
+      if (!element) return false;
+      const style = window.getComputedStyle(element);
+      const rect = element.getBoundingClientRect();
+      return style.display !== 'none'
+        && style.visibility !== 'hidden'
+        && style.opacity !== '0'
+        && rect.width > 0
+        && rect.height > 0;
+    };
+    const textOf = element => normalize(element.innerText || element.textContent || '');
+    const uniqueTexts = (selector, limit = 80) => Array.from(document.querySelectorAll(selector))
+      .filter(visible)
+      .map(textOf)
+      .filter(Boolean)
+      .filter((value, index, list) => list.indexOf(value) === index)
+      .slice(0, limit);
+    const selectLabels = Array.from(document.querySelectorAll('.ant-select'))
+      .filter(visible)
+      .map((element, index) => ({
+        index,
+        text: textOf(element).slice(0, 200),
+        classes: element.className || '',
+      }))
+      .slice(0, 40);
+    const activeDropdownOptions = uniqueTexts(
+      '.ant-select-dropdown:not(.ant-select-dropdown-hidden) .ant-select-item-option, .ant-select-dropdown:not(.ant-select-dropdown-hidden) [role="option"]',
+      100,
+    );
+    const mailTableHeaders = Array.from(document.querySelectorAll('table thead th, .ant-table-thead th, .ant-table-thead .ant-table-cell'))
+      .filter(visible)
+      .map(textOf)
+      .filter(Boolean)
+      .slice(0, 80);
+    return {
+      url: window.location.href,
+      route: window.location.pathname,
+      hash: window.location.hash,
+      bodyTextPreview: (document.body?.innerText || '').slice(0, 1200),
+      visibleButtons: uniqueTexts('button, [role="button"]'),
+      visibleLinks: uniqueTexts('a[href]'),
+      antSelectLabels: selectLabels,
+      activeDropdownOptions,
+      mailTableHeaders,
+    };
+  }).catch(error => ({
     url: '',
+    route: '',
+    hash: '',
     bodyTextPreview: error.message,
+    visibleButtons: [],
+    visibleLinks: [],
+    antSelectLabels: [],
+    activeDropdownOptions: [],
+    mailTableHeaders: [],
   }));
 
   const payload = {
     feature,
     url: preview.url,
+    route: preview.route,
+    hash: preview.hash,
     bodyTextPreview: preview.bodyTextPreview,
+    visibleButtons: preview.visibleButtons,
+    visibleLinks: preview.visibleLinks,
+    antSelectLabels: preview.antSelectLabels,
+    activeDropdownOptions: preview.activeDropdownOptions,
+    mailTableHeaders: preview.mailTableHeaders,
     screenshotPath: savedScreenshotPath,
     metadata: metadata || {},
     capturedAt: new Date().toISOString(),
   };
 
   const jsonPath = path.join(dir, `${timestamp}-${safeFeature}.json`);
+  payload.jsonPath = jsonPath;
   try {
     fs.writeFileSync(jsonPath, `${JSON.stringify(payload, null, 2)}\n`);
-    payload.jsonPath = jsonPath;
   } catch {
     payload.jsonPath = '';
   }
@@ -315,6 +507,8 @@ module.exports = {
   extractMailRows,
   robustClick,
   robustOpenMailRow,
+  getMailRowSnapshot,
+  openMailRowWithStrategy,
   waitForMailDetail,
   captureDomFailure,
   summarizeDomFailure,

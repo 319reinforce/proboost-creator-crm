@@ -1,12 +1,15 @@
 # Ready Followup Optimization Plan
 
+> Status: historical context. Some directions in this file have already been implemented, partially implemented, or superseded. For new replied-mail sync and DB-backed followup work, use `docs/mail-sync-followup-development-plan.md` as the active implementation plan.
+
 This document is for future agents taking over ProBoost Creator CRM followup work.
 
 Read first:
 
 1. `docs/agent-git-workflow.md`
 2. `docs/handoff.md`
-3. This document
+3. `docs/mail-sync-followup-development-plan.md`
+4. This document for older context when needed
 
 Before changing code, create a new working branch from GitHub as described in `docs/agent-git-workflow.md`.
 
@@ -24,6 +27,14 @@ The CRM has two related implementations:
   - `/Users/depp/proboost-ready-reminder/unused-invite-reminder.js`
 
 The most fragile area is ProBoost mailbox DOM automation. The native CRM flow can enter the replied inbox, list rows, open threads, read text, classify replies, and prepare followups, but this depends on ProBoost UI selectors and click behavior that may change.
+
+## Progress Against This Plan
+
+- Direction A is partially implemented: `selectors.js`, `domActions.js`, row extraction, row opening helpers, and basic failure screenshots/JSON exist.
+- Direction C is implemented at the schema/helper level: `mail_threads`, `mail_messages`, `analysis_results`, `upsertMailThread`, `insertMailMessage`, and `insertAnalysisResult` exist, and `ready-followup` writes opened thread text/classification.
+- Direction D is largely implemented through the send-mail SQLite migration: batch send state is mirrored and updated in SQLite, and production split/send entrypoints are now repo-owned.
+- Direction B is partially implemented: deterministic rules and optional LLM wrapper exist, but classification is still coupled to the live browser followup pass by default.
+- Direction E is partially implemented: React/Vite assets and JSON APIs exist for dashboard/send, while `/followup` still uses the legacy server-rendered surface.
 
 ## Recommended Order
 

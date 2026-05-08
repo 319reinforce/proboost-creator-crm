@@ -1,5 +1,7 @@
 # Send-Mail Integration Runbook
 
+> Archived reference. This describes the original `/Users/depp/send-mail` integration runbook. The current send-mail source of truth is `docs/send-mail-sqlite-migration-plan.md`; current project status is in `docs/handoff.md`.
+
 ## 1. 本轮目标
 
 这轮目标是把 `/Users/depp/send-mail` 里已经成熟的 ProBoost 批量发送能力接入 `proboost-creator-crm`，让 CRM 提供一个前端审核台：

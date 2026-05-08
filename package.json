@@ -12,6 +12,8 @@
     "doctor": "node src/cli/index.js doctor",
     "login": "node src/cli/index.js login",
     "search": "node src/cli/index.js search",
+    "mail-sync": "node src/cli/index.js mail-sync",
+    "mail-debug": "node src/cli/index.js mail-debug",
     "remind": "node src/cli/index.js remind",
     "ready-followup": "node src/cli/index.js ready-followup",
     "dev": "node src/web/server.js",

@@ -5,11 +5,14 @@
 Before editing code, read these documents in order:
 
 1. `docs/agent-git-workflow.md`
-2. `docs/send-mail-sqlite-migration-plan.md`
-3. `docs/followup-optimization-plan.md` if touching inbox classification, second-touch follow-up, LLM classification, or mail automation
-4. This handoff document
+2. `docs/README.md`
+3. This handoff document
+4. `docs/send-mail-sqlite-migration-plan.md` if touching batch send, SQLite send state, runtime scripts, or frontend send-work-order surfaces
+5. `docs/mail-sync-followup-development-plan.md` if touching replied-mail sync, message detail opening, mail API discovery, or DB-backed followup execution
+6. `docs/mail-sync-phase4-handoff.md` if continuing mail-sync phase 5+ work
+7. `docs/followup-optimization-plan.md` only when older followup context is needed
 
-The send-mail migration plan is the source of truth for the manifest-to-SQLite and frontend modernization roadmap. Do not continue send-mail work from memory; re-read the plan first.
+`docs/archive/` contains older roadmaps and runbooks. They are preserved for context only.
 
 ## Current Direction
 
@@ -24,7 +27,8 @@ The target is:
 - SQLite-owned campaign, batch, run, and send state
 - Express as API/orchestration layer
 - React/Vite/Tailwind frontend for operator UI
-- internal CRM-owned automation code, eventually removing `/Users/depp/send-mail` as a runtime dependency
+- internal CRM-owned automation code
+- DB-backed replied-mail sync and followup actions
 
 ## Migration Status
 
@@ -61,6 +65,11 @@ The target is:
   - send runtime lives in `src/sendMailBridge/runtime/`
   - production code no longer uses `SEND_MAIL_ROOT` or `/Users/depp/send-mail`
 
+- Followup persistence foundation
+  - `mail_threads`, `mail_messages`, `analysis_results`, and `manual_review_items` exist in schema
+  - `ready-followup` persists opened thread text and classification results
+  - rule-based classification plus optional LLM wrapper exists
+
 ### In Progress
 
 - Phase 2 frontend modernization hardening
@@ -68,11 +77,25 @@ The target is:
   - `/api/dashboard` and `/api/send-work-orders` exist
   - `/dashboard` and `/send` load `/app/assets/main.js` when the frontend bundle is built
 
+- Mail automation stabilization
+  - DOM helper files exist
+  - failure screenshots/JSON include visible controls, select labels/options, table headers, route/hash, and diagnostic paths in web task errors
+  - standalone `mail-sync` exists and writes synced thread bodies into SQLite without classifying or sending
+  - replied-mail entry supports exact/fuzzy reply status labels and inbox fallback
+  - detail opening tries multiple click/navigation strategies and reports `openStrategy`
+  - `mail-debug` records sanitized request/response artifacts under `reports/mail-debug/`
+  - `/mail-debug` provides a front-end acceptance surface for API discovery runs
+  - Phase 5 DB idempotency is implemented: mail sync stores thread sync status/errors/open strategy, generated message identity, body hashes, and run ids; repeated syncs update existing `mail_messages` rows when identity or body hash matches
+
 ### Not Yet Done
 
 - Remove the compatibility `MANIFEST_PATH` contract from the send runner internals.
 - Convert the runtime send flow from environment-variable configuration to direct typed task options.
 - Add deeper smoke coverage for headed Playwright sending in a non-production dry-run profile.
+- Implement `classify-mail`.
+- Add independent actual-registration import so second-touch reminders can filter against the real registered list, not only reply status or manual `--registered-names`.
+- Add API-backed detail sync after reviewing `mail-debug` candidates.
+- Decouple ready-followup so it consumes synced/classified database rows by default.
 
 ## Current Important Files
 
@@ -98,10 +121,16 @@ Web frontend migration:
 
 Legacy adapters and follow-up work:
 
+- `docs/followup-optimization-plan.md`
+- `docs/mail-sync-followup-development-plan.md`
+- `docs/mail-sync-phase4-handoff.md`
 - `src/automation/reminderRunner.js`
 - `src/automation/mailClient.js`
 - `src/automation/domActions.js`
 - `src/automation/selectors.js`
+- `src/automation/mailSyncRunner.js`
+- `src/automation/mailApiDiscovery.js`
+- `src/automation/mailApiClient.js`
 - `src/classifier/llmClassifier.js`
 - `src/legacyAdapters/proboostReadyReminder.js`
 
@@ -114,11 +143,11 @@ Do not modify these external projects directly unless the user explicitly asks:
 
 Treat them as read-only reference implementations. Production split/send entrypoints now live in this repo.
 
-The remaining long-term goal is to remove the compatibility manifest/env-var contract inside the project-owned runtime.
+The remaining send-mail goal is to remove the compatibility manifest/env-var contract inside the project-owned runtime. The remaining followup goal is to make mail sync and classification database-backed before sending.
 
 ## Known Verification Gaps
 
-The following checks passed:
+Previously reported checks passed:
 
 ```bash
 node -c src/db/index.js
@@ -136,7 +165,7 @@ The Phase 3 DB behavior was verified against a temporary SQLite database:
 - stale recovery marks timed-out rows failed
 - stale recovery exposes manifest paths for temporary legacy UI compatibility
 
-The following checks were blocked by sandbox/network restrictions:
+Previously reported checks were blocked by sandbox/network restrictions:
 
 ```bash
 npm install
@@ -144,9 +173,9 @@ npm run web:build
 npm run web
 ```
 
-`npm install` failed in sandbox because `registry.npmjs.org` could not resolve. Attempts to request elevated network install timed out. `npm run web` failed in sandbox with `listen EPERM 127.0.0.1:8794`; elevated run also timed out.
+The current workspace now contains built frontend assets under `src/web/public/app/assets/`, but headed browser smoke coverage still needs to be rerun before claiming production readiness.
 
-Before claiming the frontend migration is complete, install dependencies, build the frontend bundle, start the server, and inspect `/dashboard`.
+Mail-sync verification gaps are tracked in `docs/mail-sync-phase4-handoff.md`. In short: real headed `/mail-debug` still needs to run after login, headless Edge failed in this environment, local HTTP checks were blocked by sandbox approval timeout, and API-backed detail sync is not wired yet.
 
 ## Operational Safety
 
@@ -155,16 +184,19 @@ Before claiming the frontend migration is complete, install dependencies, build 
 - Do not kill the user's normal browser processes.
 - If cleanup is needed, stop only the specific legacy automation `node` process.
 - If a batch is stuck in `sending` or `preparing`, prefer the SQLite stale recovery path over hand-editing JSON.
-- Remember that `manifest.json` is still a compatibility artifact until Phase 5 is complete.
+- Remember that `manifest.json` is still a compatibility artifact even though SQLite is the CRM source of truth.
+- For mail-sync risks and verification gaps, read `docs/mail-sync-phase4-handoff.md` before changing runner behavior.
 
 ## Suggested Next Step
 
-If continuing the current roadmap, do this next:
+If continuing send-mail work, do this next:
 
-1. Resolve frontend dependency installation and lockfile state.
-2. Run `npm run web:build`.
-3. Start `npm run web`.
-4. Verify `/api/dashboard` and `/dashboard`.
-5. Continue Phase 2 by moving `/send` work orders from manifest scanning to SQLite-backed JSON APIs and React components.
+1. Remove the remaining manifest/env-var compatibility contract from `src/sendMailBridge/engine.js` and `src/sendMailBridge/runtime/`.
+2. Add headed smoke coverage for a non-production dry-run profile.
+3. Verify `/api/dashboard`, `/api/send-work-orders`, `/dashboard`, and `/send`.
 
-Do not jump to Phase 4/5 until Phase 2 is stable enough that the operator UI no longer depends on manifest scanning.
+If continuing followup work, do this next:
+
+1. Wire discovered detail API candidates into `mail-sync` with DOM fallback.
+2. Add independent actual-registration import and unmatched-row reporting.
+3. Add DB-backed `classify-mail`.

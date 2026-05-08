@@ -9,6 +9,8 @@ const { getActiveTemplate, renderTemplate } = require('../templates/render');
 const { exportCampaignReport } = require('../reporting/export');
 const { loginInteractively } = require('../automation/session');
 const { searchHandle, runReminderBatch, runReadyFollowupBatch } = require('../automation/reminderRunner');
+const { runMailSyncBatch } = require('../automation/mailSyncRunner');
+const { runMailApiDiscovery } = require('../automation/mailApiDiscovery');
 const {
   saveLogin: saveLegacyReadyLogin,
   runUnusedInviteReminder,
@@ -91,6 +93,34 @@ program
       const result = await runReminderBatch(db, options);
       console.log(JSON.stringify(result, null, 2));
     });
+  });
+
+program
+  .command('mail-sync')
+  .description('Sync ProBoost mail bodies into SQLite without classifying or sending')
+  .option('--mailbox <name>', 'mailbox to sync: replied or inbox', 'replied')
+  .option('--max-pages <n>', 'max mailbox pages to scan', '1')
+  .option('--limit <n>', 'limit messages to inspect', '0')
+  .option('--keep-open', 'keep browser open after run', false)
+  .option('--headless', 'run browser headless', false)
+  .action(async (options) => {
+    await withDb(async (db) => {
+      const result = await runMailSyncBatch(db, options);
+      console.log(JSON.stringify(result, null, 2));
+    });
+  });
+
+program
+  .command('mail-debug')
+  .description('Discover likely ProBoost mail list/detail/reply APIs from an authenticated browser session')
+  .option('--mailbox <name>', 'mailbox to open while recording: replied or inbox', 'replied')
+  .option('--duration <ms>', 'recording duration in milliseconds', '45000')
+  .option('--open-first-row', 'open the first listed row to capture detail API candidates', false)
+  .option('--keep-open', 'keep browser open after recording', false)
+  .option('--headless', 'run browser headless', false)
+  .action(async (options) => {
+    const result = await runMailApiDiscovery(options);
+    console.log(JSON.stringify(result, null, 2));
   });
 
 program

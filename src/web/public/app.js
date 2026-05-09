@@ -105,6 +105,126 @@
     </tr>`);
   }
 
+  const selectedCreatorInviteIds = new Set();
+
+  const formatDate = value => {
+    if (!value) return '-';
+    return String(value).replace('T', ' ').replace(/\.\d+Z?$/, '');
+  };
+
+  function selectedInviteIds() {
+    return Array.from(selectedCreatorInviteIds).map(id => Number.parseInt(id, 10)).filter(Number.isFinite);
+  }
+
+  function setCreatorResult(message, isError = false) {
+    const el = document.querySelector('[data-creator-result]');
+    if (!el) return;
+    el.textContent = message;
+    el.classList.toggle('hard-failed', isError);
+  }
+
+  function creatorQueryParams() {
+    const root = document.querySelector('[data-creator-management]');
+    if (!root) return '';
+    const params = new URLSearchParams();
+    const q = root.querySelector('[data-creator-filter="q"]')?.value.trim();
+    const campaign = root.querySelector('[data-creator-filter="campaign"]')?.value.trim();
+    const pendingOnly = root.querySelector('[data-creator-filter="pendingOnly"]')?.checked;
+    if (q) params.set('q', q);
+    if (campaign) params.set('campaign', campaign);
+    if (pendingOnly) params.set('status', 'pending');
+    params.set('limit', '160');
+    return params.toString();
+  }
+
+  function renderCreatorPendingRows(rows) {
+    const tbody = document.querySelector('[data-creator-rows="pending"]');
+    if (!tbody) return;
+    if (!rows.length) {
+      tbody.innerHTML = '<tr><td colspan="7">没有待推进达人。</td></tr>';
+      return;
+    }
+    tbody.innerHTML = rows.map(row => {
+      const checked = selectedCreatorInviteIds.has(String(row.inviteCodeId)) ? 'checked' : '';
+      return `<tr data-invite-code-id="${escapeHtml(row.inviteCodeId)}">
+        <td><input type="checkbox" data-creator-select value="${escapeHtml(row.inviteCodeId)}" ${checked} /></td>
+        <td><strong>${escapeHtml(row.handle || '-')}</strong><br><span class="muted">${escapeHtml(row.displayName || '-')}</span></td>
+        <td><code>${escapeHtml(row.inviteCode || '-')}</code></td>
+        <td>${escapeHtml(row.campaign || '-')}</td>
+        <td>${escapeHtml(formatDate(row.sentAt))}</td>
+        <td>${escapeHtml(row.creatorStatus || row.inviteStatus || '-')}</td>
+        <td>${escapeHtml(row.lastSecondTouchStatus || '-')}${row.lastSecondTouchAt ? `<br><span class="muted">${escapeHtml(formatDate(row.lastSecondTouchAt))}</span>` : ''}</td>
+      </tr>`;
+    }).join('');
+  }
+
+  function renderCreatorActivatedRows(rows) {
+    const tbody = document.querySelector('[data-creator-rows="activated"]');
+    if (!tbody) return;
+    if (!rows.length) {
+      tbody.innerHTML = '<tr><td colspan="5">还没有已激活达人。</td></tr>';
+      return;
+    }
+    tbody.innerHTML = rows.map(row => `<tr>
+      <td><strong>${escapeHtml(row.handle || '-')}</strong><br><span class="muted">${escapeHtml(row.displayName || '-')}</span></td>
+      <td><code>${escapeHtml(row.inviteCode || '-')}</code></td>
+      <td>${escapeHtml(formatDate(row.activatedAt || row.registeredAt))}</td>
+      <td>${escapeHtml(row.activationSource || '-')}</td>
+      <td>${escapeHtml(row.operatorNote || row.activationTaskRunId || '-')}</td>
+    </tr>`).join('');
+  }
+
+  function renderCreatorManagement(payload) {
+    const root = document.querySelector('[data-creator-management]');
+    if (!root) return;
+    const pending = payload.pending || [];
+    const activated = payload.activated || [];
+    renderCreatorPendingRows(pending);
+    renderCreatorActivatedRows(activated);
+
+    for (const [key, value] of Object.entries(payload.summary || {})) {
+      root.querySelectorAll(`[data-creator-summary="${key}"]`).forEach(el => setMetricValue(el, value));
+    }
+    root.querySelector('[data-creator-count="pending"]').textContent = String(pending.length);
+    root.querySelector('[data-creator-count="activated"]').textContent = String(activated.length);
+
+    const campaignSelect = root.querySelector('[data-creator-filter="campaign"]');
+    if (campaignSelect && campaignSelect.options.length <= 1) {
+      const current = campaignSelect.value;
+      for (const name of payload.filters?.campaigns || []) {
+        const option = document.createElement('option');
+        option.value = name;
+        option.textContent = name;
+        campaignSelect.appendChild(option);
+      }
+      campaignSelect.value = current;
+    }
+  }
+
+  async function refreshCreatorManagement() {
+    if (!document.querySelector('[data-creator-management]')) return;
+    const query = creatorQueryParams();
+    const response = await fetch(`/api/followup/creators?${query}`, { headers: { Accept: 'application/json' } });
+    if (!response.ok) return;
+    renderCreatorManagement(await response.json());
+  }
+
+  async function postCreatorAction(url, body) {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: {
+        Accept: 'application/json',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(body),
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok || payload.ok === false) {
+      throw new Error(payload.error || `request failed: ${response.status}`);
+    }
+    return payload;
+  }
+
   function setMetricValue(el, value) {
     const next = String(value || 0);
     if (el.textContent === next) return;
@@ -121,7 +241,7 @@
     const payload = await response.json();
     const result = payload.result || {};
 
-    for (const key of ['scannedRows', 'processed', 'opened', 'threadRead', 'openFailed', 'readyCount', 'whatsappFollowups', 'registerFollowups', 'skippedRegistered']) {
+    for (const key of ['scannedRows', 'processed', 'opened', 'threadRead', 'openFailed', 'skippedKnown', 'readyCount', 'whatsappFollowups', 'registerFollowups', 'skippedRegistered']) {
       const el = document.querySelector(`[data-followup-metric="${key}"]`);
       if (el) setMetricValue(el, result[key]);
     }
@@ -157,6 +277,66 @@
     if (running) running.hidden = !payload.running;
   }
 
+  let creatorFilterTimer = null;
+
+  document.addEventListener('change', event => {
+    const target = event.target;
+    if (target.matches?.('[data-creator-select]')) {
+      if (target.checked) selectedCreatorInviteIds.add(String(target.value));
+      else selectedCreatorInviteIds.delete(String(target.value));
+      return;
+    }
+    if (target.matches?.('[data-creator-filter]')) {
+      refreshCreatorManagement();
+    }
+  });
+
+  document.addEventListener('input', event => {
+    if (!event.target.matches?.('[data-creator-filter="q"]')) return;
+    clearTimeout(creatorFilterTimer);
+    creatorFilterTimer = setTimeout(refreshCreatorManagement, 220);
+  });
+
+  document.addEventListener('click', async event => {
+    const action = event.target.closest?.('[data-creator-action]')?.dataset.creatorAction;
+    if (!action) return;
+    try {
+      if (action === 'refresh') {
+        await refreshCreatorManagement();
+        setCreatorResult('达人状态已刷新。');
+        return;
+      }
+
+      const inviteCodeIds = selectedInviteIds();
+      if (inviteCodeIds.length === 0) {
+        setCreatorResult('请先选择左侧待推进达人。', true);
+        return;
+      }
+
+      if (action === 'activate') {
+        const note = document.querySelector('[data-creator-note]')?.value || '';
+        const payload = await postCreatorAction('/api/followup/creators/activate', { inviteCodeIds, note });
+        selectedCreatorInviteIds.clear();
+        renderCreatorManagement(payload);
+        setCreatorResult(`已标记 ${payload.updated || 0} 位达人为已激活。`);
+        return;
+      }
+
+      if (action === 'second-touch') {
+        const templateName = document.querySelector('[data-creator-template]')?.value || '督促产品使用';
+        const send = document.querySelector('[data-creator-send]')?.checked || false;
+        const payload = await postCreatorAction('/api/followup/creators/second-touch', {
+          inviteCodeIds,
+          templateName,
+          send,
+        });
+        setCreatorResult(`${send ? '发送' : 'Dry-run'} 工单已创建：${payload.job?.id || '-'}`);
+      }
+    } catch (error) {
+      setCreatorResult(error.message || String(error), true);
+    }
+  });
+
   document.addEventListener('submit', event => {
     const form = event.target;
     if (!(form instanceof HTMLFormElement)) return;
@@ -164,6 +344,15 @@
     form.setAttribute('aria-busy', 'true');
     submitter?.classList.add('is-submitting');
   });
+
+  document.addEventListener('click', event => {
+    const tab = event.target.closest?.('.tab');
+    if (!tab || tab.target || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+    document.querySelectorAll('.tab.is-active').forEach(item => item.classList.remove('is-active'));
+    tab.classList.add('is-active');
+  });
+
+  refreshCreatorManagement();
 
   if (!window.EventSource) return;
 
@@ -173,6 +362,7 @@
       const payload = JSON.parse(event.data);
       if (payload.type === 'ready-followup') refreshFollowup();
       if (payload.type === 'mail-debug') refreshMailDebug();
+      if (payload.type === 'creator-second-touch') refreshCreatorManagement();
     } catch {
       // Ignore malformed event payloads; explicit refresh still works.
     }

@@ -2,12 +2,15 @@
 
 ## Current Status
 
-Status as of 2026-05-06:
+Status as of 2026-05-09:
 
 - Implemented: SQLite campaign/batch tables, manifest upsert, atomic batch claims, explicit failed-batch retry, runner heartbeat, stale recovery, runtime SQLite status updates, repo-owned split logic, and repo-owned ProBoost send runtime.
 - Implemented for CRM-owned surfaces: `/api/dashboard`, `/api/send-work-orders`, dashboard/send React assets, and SQLite-backed work-order payloads.
 - Still compatible with legacy runner assumptions: `manifest.json`, `MANIFEST_PATH`, `BATCH_LIST`, and environment-variable task options are still used by `src/sendMailBridge/engine.js` and the runtime.
 - Next migration step: remove the manifest/env-var adapter contract from the runner internals and pass typed task options directly.
+- Known verifier drift: `npm run verify:followup` still references the removed
+  `src/sendMailBridge/paths` module and must be updated before it can be used as
+  the current send/followup verification gate.
 
 ## Failed Batch Retry Compatibility
 
@@ -165,3 +168,5 @@ Do not restart at Phase 1. The next useful work is to remove the remaining compa
 1. Replace `MANIFEST_PATH` / `BATCH_LIST` runner configuration with typed task inputs.
 2. Keep a compatibility manifest only for debugging or remove it entirely if no runtime code needs it.
 3. Add smoke coverage around split, claim, heartbeat, failed-batch retry, zero-send handling, and a headed dry-run send path.
+4. Update `scripts/verify-followup.js` to the current `src/sendMailBridge/`
+   module layout.

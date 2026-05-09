@@ -6,8 +6,7 @@ const {
   replyToOpenedThread,
   verifySentRecord,
   enterRepliedInbox,
-  setPageSize,
-  goToFirstPage,
+  goToPage,
   goToNextPage,
   extractInboxRows,
   extractOpenedThreadText,
@@ -18,7 +17,11 @@ const {
   insertSendLog,
   insertAnalysisResult,
 } = require('../db');
-const { persistThreadRead } = require('./mailSyncPersistence');
+const {
+  deriveMessageIdentity,
+  deriveThreadKey,
+  persistThreadRead,
+} = require('./mailSyncPersistence');
 const { classifyInboxReplyWithOptionalLlm } = require('../classifier/llmClassifier');
 const config = require('../config');
 
@@ -27,6 +30,13 @@ function parseHandles(value) {
     .split(',')
     .map(item => item.trim().toLowerCase())
     .filter(Boolean));
+}
+
+function parseIds(value) {
+  const items = Array.isArray(value) ? value : String(value || '').split(',');
+  return [...new Set(items
+    .map(item => Number.parseInt(item, 10))
+    .filter(Number.isFinite))];
 }
 
 function buildVariables(row, options) {
@@ -43,7 +53,45 @@ function buildVariables(row, options) {
 
 function selectTargets(db, options) {
   const limit = Number.parseInt(options.limit || '0', 10) || 0;
-  let rows = listUnusedInvites(db, options.campaign, 0);
+  const inviteCodeIds = parseIds(options.inviteCodeIds);
+  const creatorIds = parseIds(options.creatorIds);
+  let rows;
+
+  if (inviteCodeIds.length > 0 || creatorIds.length > 0) {
+    const clauses = ['i.status != ?', "c.status != 'do_not_contact'"];
+    const targetClauses = [];
+    const params = ['used'];
+    if (inviteCodeIds.length > 0) {
+      targetClauses.push(`i.id IN (${inviteCodeIds.map(() => '?').join(', ')})`);
+      params.push(...inviteCodeIds);
+    }
+    if (creatorIds.length > 0) {
+      targetClauses.push(`c.id IN (${creatorIds.map(() => '?').join(', ')})`);
+      params.push(...creatorIds);
+    }
+    clauses.push(`(${targetClauses.join(' OR ')})`);
+    rows = db.prepare(`
+      SELECT
+        c.id AS creator_id,
+        c.handle,
+        c.display_name,
+        c.status AS creator_status,
+        i.id AS invite_code_id,
+        i.code,
+        i.status AS invite_status,
+        i.pushed_at,
+        ca.id AS campaign_id,
+        ca.name AS campaign
+      FROM invite_codes i
+      JOIN creators c ON c.id = i.creator_id
+      JOIN campaigns ca ON ca.id = i.campaign_id
+      WHERE ${clauses.join(' AND ')}
+      ORDER BY c.handle ASC
+    `).all(...params);
+  } else {
+    rows = listUnusedInvites(db, options.campaign, 0);
+  }
+
   const handles = parseHandles(options.handles);
   if (handles.size > 0) {
     rows = rows.filter(row => handles.has(String(row.handle || '').toLowerCase()));
@@ -101,15 +149,18 @@ function persistClassification(db, { messageRecord, classification }) {
   });
 }
 
-function summarizeReadyFollowupRun({ runId, dryRun, maxPages, results, pageIndex = 1, scannedRows = 0, note = '' }) {
+function summarizeReadyFollowupRun({ runId, dryRun, syncMode = 'backfill', maxPages, pageSize = config.pageSize, results, pageIndex = 1, scannedRows = 0, note = '' }) {
   return {
     runId,
     dryRun,
+    syncMode,
     maxPages,
+    pageSize,
     pageIndex,
     scannedRows,
     note,
     processed: results.length,
+    skippedKnown: results.filter(item => item.status === 'skipped-known').length,
     opened: results.filter(item => item.opened).length,
     threadRead: results.filter(item => item.threadChars > 0).length,
     openFailed: results.filter(item => item.stage === 'open-failed').length,
@@ -121,6 +172,33 @@ function summarizeReadyFollowupRun({ runId, dryRun, maxPages, results, pageIndex
   };
 }
 
+function normalizeSyncMode(value) {
+  return value === 'incremental' ? 'incremental' : 'backfill';
+}
+
+function findExistingMailMessage(db, { providerThreadId, providerMessageId, bodyHash, mailbox = 'inbox' }) {
+  if (providerMessageId) {
+    const message = db.prepare(`
+      SELECT *
+      FROM mail_messages
+      WHERE provider_message_id = ?
+      LIMIT 1
+    `).get(providerMessageId);
+    if (message) return message;
+  }
+
+  if (!providerThreadId || !bodyHash) return null;
+  return db.prepare(`
+    SELECT m.*
+    FROM mail_messages m
+    JOIN mail_threads t ON t.id = m.thread_id
+    WHERE t.provider_thread_id = ?
+      AND COALESCE(t.mailbox, '') = COALESCE(?, '')
+      AND m.body_hash = ?
+    LIMIT 1
+  `).get(providerThreadId, mailbox, bodyHash) || null;
+}
+
 async function emitReadyFollowupProgress(options, snapshot) {
   if (typeof options.onProgress !== 'function') return;
   await options.onProgress(snapshot);
@@ -128,12 +206,7 @@ async function emitReadyFollowupProgress(options, snapshot) {
 
 async function returnToRepliedPage(page, pageIndex) {
   await enterRepliedInbox(page);
-  await setPageSize(page, config.pageSize);
-  await goToFirstPage(page);
-  for (let i = 1; i < pageIndex; i += 1) {
-    const advanced = await goToNextPage(page);
-    if (!advanced) break;
-  }
+  await goToPage(page, pageIndex);
 }
 
 async function searchHandle(options) {
@@ -218,15 +291,17 @@ async function runReminderBatch(db, options) {
       let status = 'failed';
       let verified = false;
       let errorMessage = '';
+      let replyResult = null;
 
       try {
         await openInboxResult(page, candidate);
-        const replyResult = await replyToOpenedThread(page, {
+        replyResult = await replyToOpenedThread(page, {
           templateName,
           rendered,
           dryRun,
         });
         status = replyResult.status;
+        errorMessage = replyResult.error || '';
         if (status === 'sent-unverified') {
           verified = await verifySentRecord(page, row.handle);
           status = verified ? 'sent' : 'unconfirmed';
@@ -257,6 +332,8 @@ async function runReminderBatch(db, options) {
         sender: candidate.sender,
         subject: candidate.subject,
         status,
+        templateStrategy: replyResult?.templateStrategy || '',
+        error: errorMessage || undefined,
       });
     }
 
@@ -275,6 +352,8 @@ async function runReminderBatch(db, options) {
 
 async function runReadyFollowupBatch(db, options) {
   const dryRun = !options.send;
+  const syncMode = normalizeSyncMode(options.syncMode);
+  const stopOnKnown = syncMode === 'incremental';
   const maxPages = Number.parseInt(options.maxPages || '1', 10) || 1;
   const limit = Number.parseInt(options.limit || '0', 10) || 0;
   const templateWhatsappName = options.templateWhatsapp || '感谢发送联系方式';
@@ -298,6 +377,7 @@ async function runReadyFollowupBatch(db, options) {
     await emitReadyFollowupProgress(options, summarizeReadyFollowupRun({
       runId,
       dryRun,
+      syncMode,
       maxPages,
       results,
       pageIndex: 1,
@@ -307,6 +387,7 @@ async function runReadyFollowupBatch(db, options) {
 
     let pageIndex = 1;
     let processed = 0;
+    let shouldStop = false;
     while (pageIndex <= maxPages) {
       latestPageIndex = pageIndex;
       const rows = await extractInboxRows(page);
@@ -314,6 +395,7 @@ async function runReadyFollowupBatch(db, options) {
       await emitReadyFollowupProgress(options, summarizeReadyFollowupRun({
         runId,
         dryRun,
+      syncMode,
         maxPages,
         results,
         pageIndex,
@@ -324,6 +406,7 @@ async function runReadyFollowupBatch(db, options) {
 
       for (let rowIndex = 0; rowIndex < rows.length; rowIndex += 1) {
         if (limit > 0 && processed >= limit) break;
+        if (shouldStop) break;
         const row = rows[rowIndex];
         let status = 'failed';
         let errorMessage = '';
@@ -344,6 +427,7 @@ async function runReadyFollowupBatch(db, options) {
           template: null,
           classification: null,
           opened: false,
+          knownMessage: false,
           threadChars: 0,
           threadId: null,
           messageId: null,
@@ -353,6 +437,7 @@ async function runReadyFollowupBatch(db, options) {
         await emitReadyFollowupProgress(options, summarizeReadyFollowupRun({
           runId,
           dryRun,
+      syncMode,
           maxPages,
           results,
           pageIndex,
@@ -366,6 +451,7 @@ async function runReadyFollowupBatch(db, options) {
           await emitReadyFollowupProgress(options, summarizeReadyFollowupRun({
             runId,
             dryRun,
+      syncMode,
             maxPages,
             results,
             pageIndex,
@@ -380,6 +466,7 @@ async function runReadyFollowupBatch(db, options) {
           await emitReadyFollowupProgress(options, summarizeReadyFollowupRun({
             runId,
             dryRun,
+      syncMode,
             maxPages,
             results,
             pageIndex,
@@ -389,10 +476,51 @@ async function runReadyFollowupBatch(db, options) {
 
           const threadText = await extractOpenedThreadText(page);
           resultItem.threadChars = threadText.length;
+          const providerThreadId = deriveThreadKey({ page, row, threadText });
+          const {
+            bodyHash,
+            providerMessageId,
+          } = deriveMessageIdentity({
+            providerThreadId,
+            row,
+            threadText,
+          });
+
+          if (stopOnKnown) {
+            const existingMessage = findExistingMailMessage(db, {
+              providerThreadId,
+              providerMessageId,
+              bodyHash,
+              mailbox: 'inbox',
+            });
+            if (existingMessage) {
+              status = 'skipped-known';
+              shouldStop = true;
+              resultItem.knownMessage = true;
+              resultItem.stage = 'known-message-stop';
+              resultItem.status = status;
+              resultItem.threadId = existingMessage.thread_id;
+              resultItem.messageId = existingMessage.id;
+              await emitReadyFollowupProgress(options, summarizeReadyFollowupRun({
+                runId,
+                dryRun,
+      syncMode,
+                maxPages,
+                results,
+                pageIndex,
+                scannedRows: latestScannedRows,
+                note: 'known-message-stop',
+              }));
+              break;
+            }
+          }
+
           ({ threadRecord, messageRecord } = persistThreadRead(db, {
             page,
             row,
             threadText,
+            providerThreadId,
+            providerMessageId,
           }));
           resultItem.threadId = threadRecord.id;
           resultItem.messageId = messageRecord.id;
@@ -400,6 +528,7 @@ async function runReadyFollowupBatch(db, options) {
           await emitReadyFollowupProgress(options, summarizeReadyFollowupRun({
             runId,
             dryRun,
+      syncMode,
             maxPages,
             results,
             pageIndex,
@@ -420,6 +549,7 @@ async function runReadyFollowupBatch(db, options) {
           await emitReadyFollowupProgress(options, summarizeReadyFollowupRun({
             runId,
             dryRun,
+      syncMode,
             maxPages,
             results,
             pageIndex,
@@ -456,6 +586,8 @@ async function runReadyFollowupBatch(db, options) {
               inviteCode,
             });
             status = replyResult.status;
+            errorMessage = replyResult.error || '';
+            resultItem.templateStrategy = replyResult.templateStrategy || '';
             resultItem.stage = 'reply-prepared';
           }
         } catch (error) {
@@ -485,6 +617,7 @@ async function runReadyFollowupBatch(db, options) {
         await emitReadyFollowupProgress(options, summarizeReadyFollowupRun({
           runId,
           dryRun,
+      syncMode,
           maxPages,
           results,
           pageIndex,
@@ -494,10 +627,12 @@ async function runReadyFollowupBatch(db, options) {
 
         processed += 1;
         if (limit > 0 && processed >= limit) break;
+        if (shouldStop) break;
         await returnToRepliedPage(page, pageIndex);
       }
 
       if (limit > 0 && processed >= limit) break;
+      if (shouldStop) break;
       const advanced = await goToNextPage(page);
       if (!advanced) break;
       pageIndex += 1;
@@ -512,6 +647,7 @@ async function runReadyFollowupBatch(db, options) {
     ...summarizeReadyFollowupRun({
       runId,
       dryRun,
+      syncMode,
       maxPages,
       results,
       pageIndex: latestPageIndex,

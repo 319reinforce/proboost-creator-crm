@@ -28,6 +28,17 @@ The CRM has two related implementations:
 
 The most fragile area is ProBoost mailbox DOM automation. The native CRM flow can enter the replied inbox, list rows, open threads, read text, classify replies, and prepare followups, but this depends on ProBoost UI selectors and click behavior that may change.
 
+Latest status as of 2026-05-09:
+
+- The selected-target reminder path has been stabilized against the current
+  ProBoost reply composer.
+- Template selection now verifies the target radio state.
+- The current wangEditor/Slate body editor is filled with rendered dynamic text
+  and checked before dry-run success or real send.
+- `AUTOMATION_DEBUG=1` writes reply checkpoints under `reports/dom-failures/`.
+- The remaining active plan is still `docs/mail-sync-followup-development-plan.md`;
+  this file remains historical context.
+
 ## Progress Against This Plan
 
 - Direction A is partially implemented: `selectors.js`, `domActions.js`, row extraction, row opening helpers, and basic failure screenshots/JSON exist.
@@ -35,6 +46,9 @@ The most fragile area is ProBoost mailbox DOM automation. The native CRM flow ca
 - Direction D is largely implemented through the send-mail SQLite migration: batch send state is mirrored and updated in SQLite, and production split/send entrypoints are now repo-owned.
 - Direction B is partially implemented: deterministic rules and optional LLM wrapper exist, but classification is still coupled to the live browser followup pass by default.
 - Direction E is partially implemented: React/Vite assets and JSON APIs exist for dashboard/send, while `/followup` still uses the legacy server-rendered surface.
+- Selected-target reply template/editor automation is implemented and dry-run
+  verified. A controlled one-handle real-send smoke remains before claiming the
+  final confirmation path fully verified.
 
 ## Recommended Order
 

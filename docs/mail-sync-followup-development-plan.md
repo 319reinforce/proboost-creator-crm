@@ -4,13 +4,15 @@ This plan turns the current ready-followup browser script into a durable mail-sy
 
 ## Current Status
 
-Status as of 2026-05-08:
+Status as of 2026-05-09:
 
-- Implemented: current all-in-one `ready-followup` CLI/web action, DOM helper extraction, expanded DOM failure diagnostics, `mail_threads`, `mail_messages`, `analysis_results`, rule classifier, optional LLM classifier wrapper, persistence of opened thread text/classification from the current live browser pass, standalone `mail-sync` using the current DOM detail-opening path, multi-strategy replied mailbox entry, named detail-opening strategies with row diagnostics, sanitized `mail-debug` API discovery artifacts with a web acceptance page, and Phase 5 DB idempotency columns/indexes for mail sync.
+- Implemented: current all-in-one `ready-followup` CLI/web action, DOM helper extraction, expanded DOM failure diagnostics, `mail_threads`, `mail_messages`, `analysis_results`, rule classifier, optional LLM classifier wrapper, persistence of opened thread text/classification from the current live browser pass, standalone `mail-sync`, multi-strategy replied mailbox entry, named detail-opening strategies with row diagnostics, sanitized `mail-debug` API discovery artifacts with a web acceptance page, Phase 5 DB idempotency columns/indexes for mail sync, Phase 6 API-backed detail sync with DOM fallback, Phase 7 standalone `classify-mail`, Phase 8 actual registered-list import through `npm run import-registered`, and the `/followup` creator management surface for activation state and selected dry-run second touch.
+- Implemented: selected-target followup composer stabilization. The current ProBoost reply composer uses a wangEditor/Slate-like editor, so the CRM now verifies the selected template radio, fills the editor through compatible DOM paths, and requires rendered dynamic content to appear before dry-run success or real send.
 - Verified locally: Phase 4 captured inbox rows were cross-checked against Phase 5 identity rules. ProBoost `email/receive/list` ids are better than DOM row hashes, and the local ignored SQLite DB was backfilled with API ids/body hashes for the 10 captured inbox messages.
-- Not implemented: `classify-mail`, `classificationRunner`, API-backed detail sync, independent actual-registration import, and DB-backed ready-followup execution.
-- Current blocker: discovered ProBoost mail API candidates still need to be wired into `mail-sync`; until then detail body extraction defaults to live DOM navigation.
-- Active next step: API-backed detail sync integration, then independent actual-registration import, DB-backed `classify-mail`, and DB-backed ready-followup. Use `docs/next-agent-phase-kickoff.md` as the execution checklist.
+- Verified locally: `AUTOMATION_DEBUG=1 npm run remind -- --campaign 2026-04-28 --handles ambernicole_finds --force-ambiguous` selected `督促产品使用` and verified the editor contained rendered text including `Hi ambernicole_finds!` and `Your invite code is: ZKCW45`.
+- Not implemented: DB-backed ready-followup execution, manual review queue UI, and controlled post-fix real-send smoke.
+- Current blocker: `ready-followup` still couples live sync, classification, and reply preparation/sending in one browser pass by default.
+- Active next step: run one safe real-send confirmation smoke if approved, then build DB-backed ready-followup preview/execution from synced messages and `analysis_results`. Use `docs/next-agent-phase-kickoff.md` as the execution checklist.
 
 ## 1. Current Problem
 
@@ -381,6 +383,8 @@ Without message identity or body hash, repeated scans can create duplicate `mail
 
 ## 10. Phase 6: Split Classification from Sending
 
+Status: implemented as standalone `npm run classify-mail`.
+
 ### Goal
 
 Classify already-synced messages without browser navigation.
@@ -411,6 +415,11 @@ npm run classify-mail -- --thread-id 123
 - No send action is performed in this phase.
 
 ## 11. Phase 7: Refactor Ready Followup to Consume DB State
+
+Status: not implemented. The existing all-in-one browser flow remains available.
+Selected-target `remind` dry-run is now stabilized for template selection and
+editor fill, but `ready-followup` itself still needs to be refactored to consume
+database state by default.
 
 ### Goal
 
@@ -445,6 +454,10 @@ Default web UI should use the split workflow.
 - Each sent or prepared followup references `thread_id`, `message_id`, and `analysis_id` in logs or payload JSON.
 
 ## 12. Phase 8: Web Console Changes
+
+Status: partially implemented. `/followup` now separates mailbox scanning from
+creator activation management and selected-creator dry-run second touch, but it
+does not yet expose the full sync/classify/preview/send split pipeline.
 
 ### Goal
 
@@ -522,17 +535,20 @@ Use `manual_review_items`.
 
 ## 14. Suggested Implementation Order
 
-1. Phase 0 diagnostics.
-2. Phase 1 `mail-sync` runner using current DOM opening.
-3. Phase 2 replied mailbox multi-strategy entry.
-4. Phase 3 detail opening hardening.
-5. Phase 4 mail API discovery.
-6. Phase 5 DB idempotency columns and indexes.
-7. Phase 6 standalone classification.
-8. Actual-registration import before DB-backed ready-followup filtering.
-9. Phase 7 ready-followup DB-backed refactor.
-10. Phase 8 web console split controls.
-11. Phase 9 manual review queue.
+1. Done: Phase 0 diagnostics.
+2. Done: Phase 1 `mail-sync` runner using current DOM opening.
+3. Done: Phase 2 replied mailbox multi-strategy entry.
+4. Done: Phase 3 detail opening hardening.
+5. Done: Phase 4 mail API discovery.
+6. Done: Phase 5 DB idempotency columns and indexes.
+7. Done: API-backed detail sync.
+8. Done: Phase 6 standalone classification.
+9. Done: actual-registration import through `npm run import-registered`.
+10. Done: creator activation management surface inside `/followup`.
+11. Done: selected-target reply template/editor fill stabilization for the current ProBoost composer.
+12. Next: controlled one-handle real-send smoke if the operator approves the target.
+13. Next: DB-backed ready-followup refactor.
+14. Next: web console split controls for sync/classify/preview/send and manual review queue.
 
 This order keeps the system usable after every phase and avoids making classification or sending depend on unproven sync changes.
 
@@ -585,6 +601,22 @@ Debug:
 
 ```bash
 npm run mail-debug -- --keep-open
+```
+
+Reply composer smoke:
+
+```bash
+AUTOMATION_DEBUG=1 npm run remind -- --campaign 2026-04-28 --handles <safe-handle> --force-ambiguous
+```
+
+The checkpoint JSON under `reports/dom-failures/` should show the target
+template checked and rendered dynamic body text in `editorPreviews`.
+
+Only after the operator confirms the target is safe, run a single real-send
+smoke:
+
+```bash
+AUTOMATION_DEBUG=1 npm run remind -- --campaign 2026-04-28 --handles <safe-handle> --force-ambiguous --send
 ```
 
 ### Safety Checks

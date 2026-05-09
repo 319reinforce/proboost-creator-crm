@@ -74,6 +74,26 @@ function migrateDb(db) {
     }
   }
   db.exec(`
+    CREATE TABLE IF NOT EXISTS creator_activation_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      creator_id INTEGER,
+      invite_code_id INTEGER,
+      source TEXT NOT NULL DEFAULT 'manual',
+      activated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      operator_note TEXT,
+      task_run_id TEXT,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (creator_id) REFERENCES creators(id),
+      FOREIGN KEY (invite_code_id) REFERENCES invite_codes(id),
+      FOREIGN KEY (task_run_id) REFERENCES task_runs(id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_creator_activation_events_invite
+    ON creator_activation_events (invite_code_id);
+
+    CREATE INDEX IF NOT EXISTS idx_creator_activation_events_creator
+    ON creator_activation_events (creator_id);
+
     CREATE UNIQUE INDEX IF NOT EXISTS idx_send_logs_external_key
     ON send_logs (external_source, external_id)
     WHERE external_source IS NOT NULL AND external_id IS NOT NULL;

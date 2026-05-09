@@ -13,7 +13,7 @@ const {
   recoverStaleSendMailBatches,
 } = require('../db');
 const { loginInteractively } = require('../automation/session');
-const { runReadyFollowupBatch } = require('../automation/reminderRunner');
+const { runReminderBatch, runReadyFollowupBatch } = require('../automation/reminderRunner');
 const { runMailApiDiscovery, listMailDebugRuns } = require('../automation/mailApiDiscovery');
 const { listManifestPaths, readManifest, updateBatchStatus } = require('../sendMailBridge/manifest');
 const {
@@ -48,8 +48,17 @@ const upload = multer({
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
-app.use('/assets', express.static(path.join(__dirname, 'public')));
-app.use('/app', express.static(path.join(__dirname, 'public', 'app')));
+const staticCacheOptions = {
+  maxAge: '1h',
+};
+
+const appBundleCacheOptions = {
+  maxAge: '7d',
+  immutable: true,
+};
+
+app.use('/assets', express.static(path.join(__dirname, 'public'), staticCacheOptions));
+app.use('/app', express.static(path.join(__dirname, 'public', 'app'), appBundleCacheOptions));
 
 const webDb = initDb(openDb());
 webDb.prepare(`
@@ -273,6 +282,214 @@ function recentTaskRuns(type, limit = 8) {
 
 function hasRunningJob(type) {
   return [...activeJobs.values()].some(job => job.type === type && job.status === 'running');
+}
+
+function parseIdList(value) {
+  const items = Array.isArray(value) ? value : String(value || '').split(',');
+  return [...new Set(items
+    .map(item => Number.parseInt(item, 10))
+    .filter(Number.isFinite))];
+}
+
+function creatorActivationClauses(query = {}) {
+  const clauses = [];
+  const params = {};
+  const q = String(query.q || '').trim().toLowerCase();
+  const campaign = String(query.campaign || '').trim();
+
+  if (campaign) {
+    clauses.push('ca.name = @campaign');
+    params.campaign = campaign;
+  }
+  if (q) {
+    clauses.push(`(
+      LOWER(c.handle) LIKE @q
+      OR LOWER(COALESCE(c.display_name, '')) LIKE @q
+      OR LOWER(i.code) LIKE @q
+    )`);
+    params.q = `%${q}%`;
+  }
+
+  return { clauses, params };
+}
+
+function listCreatorActivationRows(db, query = {}) {
+  const limit = Math.min(Number.parseInt(query.limit || '80', 10) || 80, 250);
+  const offset = Math.max(Number.parseInt(query.offset || '0', 10) || 0, 0);
+  const { clauses, params } = creatorActivationClauses(query);
+  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+  const rows = db.prepare(`
+    WITH latest_activation AS (
+      SELECT
+        invite_code_id,
+        MAX(id) AS event_id
+      FROM creator_activation_events
+      GROUP BY invite_code_id
+    ),
+    latest_send AS (
+      SELECT
+        invite_code_id,
+        MAX(id) AS send_log_id
+      FROM send_logs
+      WHERE invite_code_id IS NOT NULL
+      GROUP BY invite_code_id
+    )
+    SELECT
+      c.id AS creatorId,
+      c.handle,
+      c.display_name AS displayName,
+      c.status AS creatorStatus,
+      i.id AS inviteCodeId,
+      i.code AS inviteCode,
+      i.status AS inviteStatus,
+      i.pushed_at AS sentAt,
+      i.registered_at AS registeredAt,
+      ca.name AS campaign,
+      ae.source AS activationSource,
+      ae.activated_at AS activatedAt,
+      ae.operator_note AS operatorNote,
+      ae.task_run_id AS activationTaskRunId,
+      sl.status AS lastSecondTouchStatus,
+      sl.created_at AS lastSecondTouchAt,
+      sl.run_id AS lastSecondTouchRunId,
+      CASE
+        WHEN i.status = 'used'
+          OR c.status IN ('registered', 'used')
+          OR ae.id IS NOT NULL
+        THEN 1 ELSE 0
+      END AS isActivated
+    FROM invite_codes i
+    JOIN creators c ON c.id = i.creator_id
+    JOIN campaigns ca ON ca.id = i.campaign_id
+    LEFT JOIN latest_activation la ON la.invite_code_id = i.id
+    LEFT JOIN creator_activation_events ae ON ae.id = la.event_id
+    LEFT JOIN latest_send ls ON ls.invite_code_id = i.id
+    LEFT JOIN send_logs sl ON sl.id = ls.send_log_id
+    ${where}
+    ORDER BY isActivated ASC, COALESCE(i.pushed_at, i.created_at) DESC, c.handle ASC
+    LIMIT @limit OFFSET @offset
+  `).all({ ...params, limit, offset });
+
+  const normalized = rows.map(row => ({
+    ...row,
+    isActivated: Boolean(row.isActivated),
+    activationSource: row.activationSource || (row.inviteStatus === 'used' || ['registered', 'used'].includes(row.creatorStatus) ? 'activation-import' : ''),
+    activatedAt: row.activatedAt || row.registeredAt || '',
+    sentAt: row.sentAt || '',
+    lastSecondTouchAt: row.lastSecondTouchAt || '',
+    lastSecondTouchStatus: row.lastSecondTouchStatus || '',
+  }));
+
+  return normalized;
+}
+
+function creatorActivationPayload(query = {}) {
+  const rows = listCreatorActivationRows(webDb, query);
+  const pending = rows.filter(row => !row.isActivated);
+  const activated = rows.filter(row => row.isActivated);
+  const filters = {
+    campaigns: webDb.prepare('SELECT name FROM campaigns ORDER BY name ASC').all().map(row => row.name),
+  };
+  const summaryRow = webDb.prepare(`
+    SELECT
+      COUNT(*) AS total,
+      SUM(CASE WHEN i.status = 'used' OR c.status IN ('registered', 'used') OR ae.id IS NOT NULL THEN 1 ELSE 0 END) AS activated
+    FROM invite_codes i
+    JOIN creators c ON c.id = i.creator_id
+    LEFT JOIN (
+      SELECT invite_code_id, MAX(id) AS id
+      FROM creator_activation_events
+      GROUP BY invite_code_id
+    ) ae ON ae.invite_code_id = i.id
+  `).get();
+  const total = summaryRow?.total || 0;
+  const activatedCount = summaryRow?.activated || 0;
+  return {
+    pending,
+    activated,
+    summary: {
+      total,
+      pending: Math.max(total - activatedCount, 0),
+      activated: activatedCount,
+      returned: rows.length,
+    },
+    filters,
+  };
+}
+
+function markCreatorsActivated(db, { creatorIds = [], inviteCodeIds = [], note = '', taskRunId = '' } = {}) {
+  const ids = parseIdList(inviteCodeIds);
+  const creators = parseIdList(creatorIds);
+  if (ids.length === 0 && creators.length === 0) {
+    throw new Error('Select at least one creator or invite code.');
+  }
+
+  const clauses = [];
+  const params = {};
+  if (ids.length > 0) {
+    clauses.push(`i.id IN (${ids.map((_, index) => `@invite${index}`).join(', ')})`);
+    ids.forEach((id, index) => { params[`invite${index}`] = id; });
+  }
+  if (creators.length > 0) {
+    clauses.push(`c.id IN (${creators.map((_, index) => `@creator${index}`).join(', ')})`);
+    creators.forEach((id, index) => { params[`creator${index}`] = id; });
+  }
+
+  const rows = db.prepare(`
+    SELECT i.id AS inviteCodeId, i.creator_id AS creatorId
+    FROM invite_codes i
+    JOIN creators c ON c.id = i.creator_id
+    WHERE ${clauses.join(' OR ')}
+  `).all(params);
+
+  const now = new Date().toISOString();
+  const updateInvite = db.prepare(`
+    UPDATE invite_codes
+    SET status = 'used',
+        registered_at = COALESCE(registered_at, @now),
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = @inviteCodeId
+  `);
+  const updateCreator = db.prepare(`
+    UPDATE creators
+    SET status = 'registered',
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = @creatorId
+  `);
+  const insertEvent = db.prepare(`
+    INSERT INTO creator_activation_events (
+      creator_id,
+      invite_code_id,
+      source,
+      activated_at,
+      operator_note,
+      task_run_id
+    )
+    VALUES (
+      @creatorId,
+      @inviteCodeId,
+      'manual',
+      @now,
+      @note,
+      @taskRunId
+    )
+  `);
+
+  db.transaction(() => {
+    for (const row of rows) {
+      updateInvite.run({ inviteCodeId: row.inviteCodeId, now });
+      updateCreator.run({ creatorId: row.creatorId });
+      insertEvent.run({
+        creatorId: row.creatorId,
+        inviteCodeId: row.inviteCodeId,
+        now,
+        note: note || null,
+        taskRunId: taskRunId || null,
+      });
+    }
+  })();
+
+  return rows;
 }
 
 function summarizeLog(filePath) {
@@ -586,11 +803,13 @@ function renderInboxClassification() {
   }).join('');
 
   const summary = result ? `<div class="stats">
+    <span class="metric"><strong>${result.syncMode === 'incremental' ? '增量' : '全量'}</strong> 模式</span>
     <span class="metric"><strong data-followup-metric="scannedRows">${result.scannedRows || 0}</strong> 列表行</span>
     <span class="metric"><strong data-followup-metric="processed">${result.processed || 0}</strong> 已检查</span>
     <span class="metric"><strong data-followup-metric="opened">${result.opened || 0}</strong> 已点开</span>
     <span class="metric"><strong data-followup-metric="threadRead">${result.threadRead || 0}</strong> 已读正文</span>
     <span class="metric"><strong data-followup-metric="openFailed">${result.openFailed || 0}</strong> 点开失败</span>
+    <span class="metric"><strong data-followup-metric="skippedKnown">${result.skippedKnown || 0}</strong> 已知停止</span>
     <span class="metric"><strong data-followup-metric="readyCount">${result.readyCount || 0}</strong> ready</span>
     <span class="metric"><strong data-followup-metric="whatsappFollowups">${result.whatsappFollowups || 0}</strong> 联系方式跟进</span>
     <span class="metric"><strong data-followup-metric="registerFollowups">${result.registerFollowups || 0}</strong> 注册提醒</span>
@@ -608,14 +827,8 @@ function renderInboxClassification() {
     <td>${job.error ? `<details><summary>错误</summary>${renderDiagnosticLinks(job.error)}<pre>${escapeHtml(job.error)}</pre></details>` : escapeHtml(job.result?.runId || job.runId || '-')}</td>
   </tr>`).join('');
 
-  return `<section id="inbox-classifier">
-    <h2>收件箱分类与二次触达</h2>
-    <form method="post" action="/inbox/ready-followup">
+  const commonFields = `
       <div class="grid">
-        <div>
-          <label>扫描页数</label>
-          <input name="maxPages" type="number" min="1" value="1" />
-        </div>
         <div>
           <label>检查封数上限</label>
           <input name="limit" type="number" min="0" value="10" />
@@ -637,17 +850,126 @@ function renderInboxClassification() {
           <input name="registeredNames" placeholder="逗号分隔 handle 或名字" />
         </div>
       </div>
-      <p class="muted">默认只 dry-run：打开已回复收件箱、逐封读取正文、判断 ready/联系方式/邀请码，并记录推荐动作。勾选真实发送才会回复邮件。</p>
-      <p class="muted">当前登录态：${escapeHtml(config.auth.profilePath)}。如果需要登录，先打开登录窗口，完成登录后窗口会自动关闭并保存登录态。</p>
+      <p class="muted">默认 dry-run：打开已回复收件箱、读取正文、判断 ready/联系方式/邀请码，并记录推荐动作。勾选真实发送才会回复邮件。</p>
       <label class="row" style="display:inline-flex; margin:0 12px 0 0">
         <input name="send" type="checkbox" value="1" style="width:auto" />
         真实发送二次触达
       </label>
-      <button type="submit">开始检查收件箱</button>
-    </form>
+  `;
+
+  const creatorManagement = `
+    <div id="creator-management" class="creator-management" data-creator-management>
+      <div class="creator-management-head">
+        <div>
+          <h3>达人管理</h3>
+          <p class="muted">左侧是已推送邀请码但未确认激活的达人；右侧是已激活或已手动标记使用的达人。</p>
+        </div>
+        <div class="creator-summary" aria-live="polite">
+          <span><strong data-creator-summary="pending">0</strong> 待推进</span>
+          <span><strong data-creator-summary="activated">0</strong> 已激活</span>
+        </div>
+      </div>
+      <div class="creator-filters">
+        <label>
+          搜索达人/邀请码
+          <input data-creator-filter="q" placeholder="handle / name / invite code" />
+        </label>
+        <label>
+          Campaign
+          <select data-creator-filter="campaign">
+            <option value="">全部 campaign</option>
+          </select>
+        </label>
+        <label class="checkbox-line">
+          <input data-creator-filter="pendingOnly" type="checkbox" checked />
+          只看待推进
+        </label>
+        <button class="secondary compact" type="button" data-creator-action="refresh">刷新</button>
+      </div>
+      <div class="creator-actions">
+        <button class="secondary" type="button" data-creator-action="activate">转移到右侧已激活</button>
+        <label>
+          二次触达模板
+          <input data-creator-template value="督促产品使用" />
+        </label>
+        <label class="checkbox-line">
+          <input data-creator-send type="checkbox" />
+          真实发送
+        </label>
+        <button type="button" data-creator-action="second-touch">推动指定人的二次触达</button>
+        <input data-creator-note placeholder="操作备注" />
+      </div>
+      <p class="muted creator-action-result" data-creator-result>默认 dry-run；勾选真实发送才会回复邮件。</p>
+      <div class="creator-panes">
+        <div class="creator-pane">
+          <div class="pane-heading">
+            <h4>已推送邀请码</h4>
+            <span data-creator-count="pending">0</span>
+          </div>
+          <div class="batch-box creator-table-wrap">
+            <table>
+              <thead><tr><th>选择</th><th>达人</th><th>邀请码</th><th>Campaign</th><th>推送时间</th><th>最近状态</th><th>上次触达</th></tr></thead>
+              <tbody data-creator-rows="pending"><tr><td colspan="7">加载中...</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="creator-pane">
+          <div class="pane-heading">
+            <h4>已激活/已使用</h4>
+            <span data-creator-count="activated">0</span>
+          </div>
+          <div class="batch-box creator-table-wrap">
+            <table>
+              <thead><tr><th>达人</th><th>邀请码</th><th>激活时间</th><th>来源</th><th>备注/审计</th></tr></thead>
+              <tbody data-creator-rows="activated"><tr><td colspan="5">加载中...</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+
+  return `<section id="inbox-classifier">
+    <h2>收件箱分类与二次触达</h2>
+    <div class="followup-modes">
+      <form method="post" action="/inbox/ready-followup" class="followup-mode">
+        <input type="hidden" name="syncMode" value="backfill" />
+        <div class="mode-heading">
+          <span class="mode-kicker">一次性基线</span>
+          <h3>全量历史收件箱回填</h3>
+          <p class="muted">第一次使用时跑它，把历史已回复邮件读入本地库。可扫多页；不会因为遇到已知邮件而停。</p>
+        </div>
+        <div class="grid mode-grid">
+          <div>
+            <label>历史扫描页数</label>
+            <input name="maxPages" type="number" min="1" value="20" />
+          </div>
+        </div>
+        ${commonFields}
+        <button type="submit">开始全量回填</button>
+      </form>
+      <form method="post" action="/inbox/ready-followup" class="followup-mode is-incremental">
+        <input type="hidden" name="syncMode" value="incremental" />
+        <div class="mode-heading">
+          <span class="mode-kicker">日常巡检</span>
+          <h3>增量检测新邮件</h3>
+          <p class="muted">每天跑它，只处理最新未入库邮件；遇到第一封已知邮件后自动停止，避免重复检查历史。</p>
+        </div>
+        <div class="grid mode-grid">
+          <div>
+            <label>最多向后检查页数</label>
+            <input name="maxPages" type="number" min="1" value="3" />
+          </div>
+        </div>
+        ${commonFields}
+        <button type="submit">只检测新邮件</button>
+      </form>
+    </div>
+    <p class="muted">当前登录态：${escapeHtml(config.auth.profilePath)}。如果需要登录，先打开登录窗口，完成登录后窗口会自动关闭并保存登录态。</p>
     <form method="post" action="/auth/login" style="margin-top:10px">
       <button class="secondary" type="submit">登录并保存 ProBoost 状态</button>
     </form>
+    ${creatorManagement}
     ${latest ? `<details open style="margin-top:16px">
       <summary>最近一次分类结果</summary>
       <div id="followup-summary">${summary}</div>
@@ -813,22 +1135,26 @@ function followupSummaryPayload() {
       templateName: latest.templateName || '',
     } : null,
     result: result ? {
+      syncMode: result.syncMode || 'backfill',
       scannedRows: result.scannedRows || 0,
       processed: result.processed || 0,
       opened: result.opened || 0,
       threadRead: result.threadRead || 0,
       openFailed: result.openFailed || 0,
+      skippedKnown: result.skippedKnown || 0,
       readyCount: result.readyCount || 0,
       whatsappFollowups: result.whatsappFollowups || 0,
       registerFollowups: result.registerFollowups || 0,
       skippedRegistered: result.skippedRegistered || 0,
       runId: result.runId || '',
     } : {
+      syncMode: 'backfill',
       scannedRows: 0,
       processed: 0,
       opened: 0,
       threadRead: 0,
       openFailed: 0,
+      skippedKnown: 0,
       readyCount: 0,
       whatsappFollowups: 0,
       registerFollowups: 0,
@@ -1005,6 +1331,101 @@ app.get('/api/followup-summary', (_req, res) => {
   res.json(followupSummaryPayload());
 });
 
+app.get('/api/followup/creators', (req, res, next) => {
+  try {
+    res.json(creatorActivationPayload(req.query));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/followup/creators/activate', (req, res, next) => {
+  try {
+    const inviteCodeIds = parseIdList(req.body.inviteCodeIds);
+    const creatorIds = parseIdList(req.body.creatorIds);
+    if (inviteCodeIds.length === 0 && creatorIds.length === 0) {
+      res.status(400).json({ ok: false, error: 'Select at least one creator.' });
+      return;
+    }
+    const note = String(req.body.note || '').trim();
+    const taskId = `activation_${new Date().toISOString().replace(/[:.]/g, '-')}`;
+    const startedAt = new Date().toISOString();
+    upsertTaskRun(webDb, {
+      id: taskId,
+      type: 'creator-activation',
+      status: 'finished',
+      templateName: 'manual activation',
+      payload: { creatorIds, inviteCodeIds, note },
+      result: null,
+      startedAt,
+      finishedAt: startedAt,
+    });
+    const updatedRows = markCreatorsActivated(webDb, {
+      creatorIds,
+      inviteCodeIds,
+      note,
+      taskRunId: taskId,
+    });
+    updateTaskRun(webDb, taskId, {
+      result: { updated: updatedRows.length },
+    });
+    res.json({
+      ok: true,
+      updated: updatedRows.length,
+      taskRunId: taskId,
+      ...creatorActivationPayload(req.query),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/followup/creators/second-touch', (req, res, next) => {
+  try {
+    if (hasRunningJob('auth-login') || hasRunningJob('creator-second-touch')) {
+      res.status(409).json({ ok: false, error: 'Another login or selected second-touch job is running.' });
+      return;
+    }
+    const inviteCodeIds = parseIdList(req.body.inviteCodeIds);
+    const creatorIds = parseIdList(req.body.creatorIds);
+    if (inviteCodeIds.length === 0 && creatorIds.length === 0) {
+      res.status(400).json({ ok: false, error: 'Select at least one creator.' });
+      return;
+    }
+    const templateName = String(req.body.templateName || '督促产品使用').trim() || '督促产品使用';
+    const send = req.body.send === true || req.body.send === '1' || req.body.send === 'on';
+    const job = startJob({
+      type: 'creator-second-touch',
+      templateName: `${send ? '发送' : 'Dry-run'}：${templateName}`,
+      task: async () => {
+        const db = initDb(openDb());
+        try {
+          return await runReminderBatch(db, {
+            inviteCodeIds,
+            creatorIds,
+            template: templateName,
+            send,
+            keepOpen: false,
+            headless: false,
+          });
+        } finally {
+          db.close();
+        }
+      },
+    });
+    res.json({
+      ok: true,
+      job: {
+        id: job.id,
+        status: job.status,
+        templateName: job.templateName,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get('/api/mail-debug-summary', (_req, res) => {
   res.json(mailDebugSummaryPayload());
 });
@@ -1081,6 +1502,7 @@ app.post('/upload', upload.array('files', 20), async (req, res, next) => {
 
 function readyFollowupOptionsFromBody(body) {
   return {
+    syncMode: body.syncMode === 'incremental' ? 'incremental' : 'backfill',
     maxPages: body.maxPages || '1',
     limit: body.limit || '10',
     readyKeywords: body.readyKeywords || 'ready',
@@ -1108,7 +1530,7 @@ app.post('/inbox/ready-followup', async (req, res, next) => {
         status: 'failed',
         startedAt: new Date().toISOString(),
         finishedAt: new Date().toISOString(),
-        templateName: `${options.templateWhatsapp} / ${options.templateRegister}`,
+        templateName: `${options.syncMode === 'incremental' ? '增量' : '全量'}：${options.templateWhatsapp} / ${options.templateRegister}`,
         options: reportOptions,
         result: null,
         error: 'ProBoost 登录窗口仍在运行。请先在打开的窗口完成登录，等窗口自动关闭并保存登录态后，再开始检查收件箱。',
@@ -1118,7 +1540,7 @@ app.post('/inbox/ready-followup', async (req, res, next) => {
     }
     startJob({
       type: 'ready-followup',
-      templateName: `${options.templateWhatsapp} / ${options.templateRegister}`,
+      templateName: `${options.syncMode === 'incremental' ? '增量' : '全量'}：${options.templateWhatsapp} / ${options.templateRegister}`,
       task: async () => {
         const startedAt = new Date().toISOString();
         const writeReport = (payload) => writeJson(reportPath, {
@@ -1126,7 +1548,7 @@ app.post('/inbox/ready-followup', async (req, res, next) => {
           status: payload.status,
           startedAt,
           finishedAt: payload.finishedAt || '',
-          templateName: `${options.templateWhatsapp} / ${options.templateRegister}`,
+          templateName: `${options.syncMode === 'incremental' ? '增量' : '全量'}：${options.templateWhatsapp} / ${options.templateRegister}`,
           options: reportOptions,
           result: payload.result || null,
           error: payload.error || '',

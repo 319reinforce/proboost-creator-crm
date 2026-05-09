@@ -1,6 +1,6 @@
 # Mail Sync Phase 0-5 Handoff
 
-Status as of 2026-05-08. Phase 5 DB idempotency has landed on top of the Phase 0-4 foundation, and Phase 4 captured inbox data was cross-checked locally against the Phase 5 identity model.
+Status as of 2026-05-09. Phase 8 has landed on top of the Phase 0-5 foundation: API-backed detail sync is wired into `mail-sync`, standalone DB-backed classification is available through `npm run classify-mail`, actual registered-list import is available through `npm run import-registered`, and selected-target reply template/editor fill has been stabilized against the current ProBoost composer.
 
 ## What Landed
 
@@ -104,6 +104,72 @@ Key files:
 - `src/automation/mailSyncPersistence.js`
 - `src/automation/mailSyncRunner.js`
 
+### Phase 6: API-Backed Detail Sync
+
+- `mailApiClient` now defaults to the reviewed ProBoost receive endpoints:
+  - `POST /api/v1/email/receive/list`
+  - `POST /api/v1/email/receive/detail`
+- `mail-sync` attempts API list/detail reads through browser-context auth before DOM detail opening.
+- API-backed reads persist `provider_thread_id` and `provider_message_id` as `api:email/receive:<id>`.
+- `--detail-source dom` forces the old DOM path; `--detail-source api` disables DOM fallback for stricter API validation.
+
+Key files:
+
+- `src/automation/mailApiClient.js`
+- `src/automation/mailSyncRunner.js`
+- `src/automation/mailSyncPersistence.js`
+
+### Phase 7: Standalone Classification
+
+- `npm run classify-mail` classifies already-synced inbound messages from SQLite.
+- It skips messages that already have an `analysis_results` row for the same `prompt_version`.
+- It persists `analysis_results` and creates `manual_review_items` for manual-review/low-confidence cases.
+- It does not open a browser and does not write `send_logs`.
+
+Key files:
+
+- `src/automation/classificationRunner.js`
+- `src/cli/index.js`
+- `package.json`
+
+### Phase 8: Actual Registration Import
+
+- `npm run import-registered` imports actual registered/activated lists from
+  `.xlsx`, `.xls`, `.csv`, `.tsv`, or text files.
+- Matching prefers invite code and then unique handle/name/email matches.
+- Matched rows update `creators.status = 'registered'` and
+  `invite_codes.status = 'used'`.
+- Matched rows write `creator_activation_events` audit entries.
+- Unmatched and ambiguous rows are returned in CLI JSON output.
+
+Key files:
+
+- `src/importer/importRegistered.js`
+- `src/db/schema.js`
+- `src/db/index.js`
+- `src/cli/index.js`
+- `package.json`
+
+### Reply Composer Stabilization
+
+- `replyToOpenedThread()` now passes rendered template data into template
+  selection so it can distinguish "template selected" from "rendered body
+  verified".
+- Template selection confirms the target radio is checked and the send button is
+  available; rendered body insertion is verified separately.
+- The current ProBoost editor behaves like wangEditor/Slate rather than Quill.
+  The fill path now falls back through paste/Slate-compatible DOM insertion and
+  verifies that dynamic rendered lines exist in the editor.
+- A dry-run no longer reports success if the editor still contains placeholders
+  such as `${达人名称}`.
+- `AUTOMATION_DEBUG=1` captures reply checkpoints under `reports/dom-failures/`
+  with template radio state, subject inputs, editor previews, buttons, and
+  dialogs.
+
+Key file:
+
+- `src/automation/mailClient.js`
+
 ## Verification Performed
 
 Static checks passed:
@@ -134,7 +200,21 @@ CLI checks passed:
 ```bash
 npm run mail-sync -- --help
 npm run mail-debug -- --help
+npm run import-registered -- --help
 ```
+
+Reply composer smoke passed:
+
+```bash
+node --check src/automation/mailClient.js
+node -e "require('./src/automation/mailClient')"
+AUTOMATION_DEBUG=1 npm run remind -- --campaign 2026-04-28 --handles ambernicole_finds --force-ambiguous
+npm run remind -- --campaign 2026-04-28 --handles ambernicole_finds --force-ambiguous
+```
+
+The debug checkpoint confirmed `督促产品使用` was checked and the editor
+contained rendered text including `Hi ambernicole_finds!` and
+`Your invite code is: ZKCW45`.
 
 SQLite safety check passed against a temporary database:
 
@@ -160,28 +240,22 @@ Phase 4 captured data cross-check passed locally:
 - A real headed `/mail-debug` run still needs to be performed after ProBoost login is valid.
 - Headless `mail-debug` smoke previously failed in this environment because Microsoft Edge closed during persistent-profile launch with `kill EPERM`.
 - The `/mail-debug` page still needs manual browser inspection after a current web server smoke.
-- API-backed `mail-sync` has not been wired yet; Phase 4 only discovers candidates.
+- Real headed `mail-sync` still needs to be run against a current login to validate the live API request payloads.
+- A controlled one-handle real `--send` smoke still needs operator approval to validate the final confirmation chain after the editor-fill fix.
+- `npm run verify:followup` currently fails because `scripts/verify-followup.js`
+  imports the removed `../src/sendMailBridge/paths` module.
 
 ## Remaining Work
 
 Next recommended order:
 
-1. Wire discovered detail API into `mail-sync`:
-   - choose candidate from `reports/mail-debug/<run-id>/candidates.json`
-   - add endpoint configuration
-   - fetch detail body through browser context cookies
-   - keep DOM opening as fallback
-2. Add `classify-mail`:
-   - classify already-synced inbound messages with browser closed
-   - persist `analysis_results`
-   - avoid all send actions
-3. Add registration-list import for the real registered source of truth:
-   - import latest actual registered list independently from initial push import
-   - update creator/invite-code registered state
-   - report unmatched rows before followup actions
-4. Refactor `ready-followup`:
+1. Refactor `ready-followup`:
    - consume DB-backed synced/classified rows
    - keep real send explicit with `--send`
+2. Add web upload/control for registered-list import, building on the completed
+   CLI import.
+3. Update or replace `scripts/verify-followup.js` so it targets the current
+   repo-owned runtime layout.
 
 ## Potential Issues To Watch
 

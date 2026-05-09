@@ -23,8 +23,14 @@ function page(title, body, activeTab = 'send') {
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <meta name="theme-color" content="#f4f1ea" />
   <title>${escapeHtml(title)}</title>
-  <link rel="stylesheet" href="/assets/app.css" />
-  <script defer src="/assets/app.js"></script>
+  <link rel="icon" href="/assets/favicon.svg" type="image/svg+xml" />
+  <link rel="shortcut icon" href="/assets/favicon.svg" />
+  <link rel="stylesheet" href="/assets/app.css?v=20260509-creators" />
+  <link rel="prefetch" href="/send" />
+  <link rel="prefetch" href="/followup" />
+  <link rel="prefetch" href="/mail-debug" />
+  <link rel="prefetch" href="/dashboard" />
+  <script defer src="/assets/app.js?v=20260509-creators"></script>
 </head>
 <body>
   <header class="app-header">

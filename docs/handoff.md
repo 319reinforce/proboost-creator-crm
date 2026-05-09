@@ -6,12 +6,13 @@ Before editing code, read these documents in order:
 
 1. `docs/agent-git-workflow.md`
 2. `docs/README.md`
-3. This handoff document
-4. `docs/send-mail-sqlite-migration-plan.md` if touching batch send, SQLite send state, runtime scripts, or frontend send-work-order surfaces
-5. `docs/mail-sync-followup-development-plan.md` if touching replied-mail sync, message detail opening, mail API discovery, or DB-backed followup execution
-6. `docs/mail-sync-phase4-handoff.md` if continuing mail-sync phase 5+ work
-7. `docs/next-agent-phase-kickoff.md` before starting the next implementation phase
-8. `docs/followup-optimization-plan.md` only when older followup context is needed
+3. `docs/current-project-overview.md`
+4. This handoff document
+5. `docs/send-mail-sqlite-migration-plan.md` if touching batch send, SQLite send state, runtime scripts, or frontend send-work-order surfaces
+6. `docs/mail-sync-followup-development-plan.md` if touching replied-mail sync, message detail opening, mail API discovery, or DB-backed followup execution
+7. `docs/mail-sync-phase4-handoff.md` if continuing mail-sync phase 5+ work
+8. `docs/next-agent-phase-kickoff.md` before starting the next implementation phase
+9. `docs/followup-optimization-plan.md` only when older followup context is needed
 
 `docs/archive/` contains older roadmaps and runbooks. They are preserved for context only.
 
@@ -74,6 +75,15 @@ The target is:
   - `mail_threads`, `mail_messages`, `analysis_results`, and `manual_review_items` exist in schema
   - `ready-followup` persists opened thread text and classification results
   - rule-based classification plus optional LLM wrapper exists
+  - `creator_activation_events` records manual and imported activation state
+  - `npm run import-registered` imports actual registered/activated lists
+  - `/followup` has creator activation management and selected dry-run second touch
+
+- Selected-target reply composer stabilization
+  - `replyToOpenedThread()` verifies the target template radio before continuing
+  - the current ProBoost wangEditor/Slate composer is filled with rendered body text instead of leaving `${达人名称}` placeholders
+  - dynamic rendered content is verified in the editor before dry-run success or real send
+  - `AUTOMATION_DEBUG=1` writes reply checkpoints for template selected, template filled, before send click, and unsuccessful confirmation
 
 ### In Progress
 
@@ -92,16 +102,20 @@ The target is:
   - `/mail-debug` provides a front-end acceptance surface for API discovery runs
 - Phase 5 DB idempotency is implemented: mail sync stores thread sync status/errors/open strategy, generated message identity, body hashes, and run ids; repeated syncs update existing `mail_messages` rows when identity or body hash matches
   - Phase 4 captured inbox data was cross-checked locally against Phase 5 identity rules: ProBoost `email/receive/list` ids were better than DOM row hashes, and the local SQLite DB was backfilled with API ids/body hashes. Those local DB/report artifacts are intentionally not committed.
+- Phase 6 API-backed detail sync is implemented: `mail-sync` uses `POST /api/v1/email/receive/list` and `POST /api/v1/email/receive/detail` through browser-context auth when available, persists `api:email/receive:<id>` identities, and keeps DOM detail opening as fallback.
+- Phase 7 standalone classification is implemented: `npm run classify-mail` classifies synced inbound `mail_messages` from SQLite, skips messages already analyzed for the same prompt version, persists `analysis_results`, and creates manual-review rows for review cases without opening a browser or writing `send_logs`.
+- Phase 8 actual-registration import is implemented: `npm run import-registered` supports `.xlsx`, `.xls`, `.csv`, `.tsv`, and text inputs, matches invite code first, updates creator/invite activation state, writes activation audit rows, and returns unmatched rows.
+- Reply send confirmation stabilization is partially verified: selected-target dry-run now proves template selection and editor fill on a live thread; a controlled one-handle `--send` smoke is still needed before marking the full confirmation chain production-ready.
 
 ### Not Yet Done
 
 - Remove the compatibility `MANIFEST_PATH` contract from the send runner internals.
 - Convert the runtime send flow from environment-variable configuration to direct typed task options.
 - Add deeper smoke coverage for headed Playwright sending in a non-production dry-run profile.
-- Implement `classify-mail`.
-- Add independent actual-registration import so second-touch reminders can filter against the real registered list, not only reply status or manual `--registered-names`.
-- Add API-backed detail sync after reviewing `mail-debug` candidates.
 - Decouple ready-followup so it consumes synced/classified database rows by default.
+- Add a web upload/control for registered-list import; CLI import already exists.
+- Update `scripts/verify-followup.js`; it still imports the removed `../src/sendMailBridge/paths` module.
+- Build a manual review queue UI for `manual_review_items`.
 
 ## Current Important Files
 
@@ -137,6 +151,7 @@ Legacy adapters and follow-up work:
 - `src/automation/mailSyncRunner.js`
 - `src/automation/mailApiDiscovery.js`
 - `src/automation/mailApiClient.js`
+- `src/importer/importRegistered.js`
 - `src/classifier/llmClassifier.js`
 - `src/legacyAdapters/proboostReadyReminder.js`
 
@@ -182,7 +197,31 @@ npm run web
 
 The current workspace now contains built frontend assets under `src/web/public/app/assets/`, but headed browser smoke coverage still needs to be rerun before claiming production readiness.
 
-Mail-sync verification gaps are tracked in `docs/mail-sync-phase4-handoff.md`. In short: real headed `/mail-debug` still needs to run after login, headless Edge failed in this environment, local HTTP checks were blocked by sandbox approval timeout, and API-backed detail sync is not wired yet.
+Mail-sync verification gaps are tracked in `docs/mail-sync-phase4-handoff.md`. In short: real headed `/mail-debug` still needs to run after login, and headless Edge failed in this environment. API-backed detail sync is now wired with DOM fallback.
+
+Latest reply-composer verification performed on 2026-05-09:
+
+```bash
+node --check src/automation/mailClient.js
+node -e "require('./src/automation/mailClient')"
+AUTOMATION_DEBUG=1 npm run remind -- --campaign 2026-04-28 --handles ambernicole_finds --force-ambiguous
+npm run remind -- --campaign 2026-04-28 --handles ambernicole_finds --force-ambiguous
+```
+
+The dry-run opened a live ProBoost thread, selected `督促产品使用`, and verified
+that the editor contained rendered dynamic text including `Hi ambernicole_finds!`
+and `Your invite code is: ZKCW45`. Real `--send` was intentionally not run to
+avoid duplicate outreach without operator approval.
+
+Known broken verifier:
+
+```bash
+npm run verify:followup
+```
+
+It fails because `scripts/verify-followup.js` requires
+`../src/sendMailBridge/paths`, which no longer exists in the current
+repo-owned runtime layout.
 
 ## Operational Safety
 
@@ -206,6 +245,7 @@ If continuing send-mail work, do this next:
 
 If continuing followup work, do this next:
 
-1. Wire discovered detail API candidates into `mail-sync` with DOM fallback.
-2. Add independent actual-registration import and unmatched-row reporting.
-3. Add DB-backed `classify-mail`.
+1. Run a controlled one-handle `--send` smoke only after the operator confirms the target is safe.
+2. Refactor `ready-followup` so the default path consumes synced/classified database rows.
+3. Add web controls for sync, classification, registered-list import, preview, and send.
+4. Add manual review queue UI before enabling DB-backed bulk sends.

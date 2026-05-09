@@ -31,3 +31,17 @@ Normalized output:
 
 The classifier should only recommend actions. It should not directly trigger real sends.
 `manual_review`, low-confidence LLM results, `ignore`, and `skip_registered` must not enter the send path.
+
+## Current Status
+
+As of 2026-05-09:
+
+- `inboxRules.js` provides the deterministic default classifier.
+- `llmClassifier.js` remains explicit opt-in and must degrade back to rules.
+- `classificationRunner.js` supports `npm run classify-mail`, which classifies
+  already-synced `mail_messages` from SQLite without opening a browser.
+- Classification results are persisted to `analysis_results`; manual-review
+  cases can create `manual_review_items`.
+- The remaining followup work is to make `ready-followup` consume these
+  persisted classifications by default instead of scanning/classifying/sending
+  in one live browser pass.

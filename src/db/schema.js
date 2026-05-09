@@ -37,6 +37,20 @@ CREATE TABLE IF NOT EXISTS invite_codes (
   FOREIGN KEY (campaign_id) REFERENCES campaigns(id)
 );
 
+CREATE TABLE IF NOT EXISTS creator_activation_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  creator_id INTEGER,
+  invite_code_id INTEGER,
+  source TEXT NOT NULL DEFAULT 'manual',
+  activated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  operator_note TEXT,
+  task_run_id TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (creator_id) REFERENCES creators(id),
+  FOREIGN KEY (invite_code_id) REFERENCES invite_codes(id),
+  FOREIGN KEY (task_run_id) REFERENCES task_runs(id)
+);
+
 CREATE TABLE IF NOT EXISTS templates (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   name TEXT NOT NULL,

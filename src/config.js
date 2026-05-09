@@ -30,7 +30,7 @@ module.exports = {
   repliedUrl: process.env.REPLIED_URL || '',
   sentUrl: process.env.SENT_URL || 'https://mail.proboost.microdata-inc.com/mail/sent',
   auth,
-  pageSize: Number(process.env.PAGE_SIZE || 100),
+  pageSize: Number(process.env.PAGE_SIZE || 10),
   loginTimeout: Number(process.env.LOGIN_TIMEOUT || 300000),
   pageLoadTimeout: Number(process.env.PAGE_LOAD_TIMEOUT || 60000),
   sendConfirmTimeout: Number(process.env.SEND_CONFIRM_TIMEOUT || 10000),

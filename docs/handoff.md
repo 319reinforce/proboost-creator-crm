@@ -10,7 +10,8 @@ Before editing code, read these documents in order:
 4. `docs/send-mail-sqlite-migration-plan.md` if touching batch send, SQLite send state, runtime scripts, or frontend send-work-order surfaces
 5. `docs/mail-sync-followup-development-plan.md` if touching replied-mail sync, message detail opening, mail API discovery, or DB-backed followup execution
 6. `docs/mail-sync-phase4-handoff.md` if continuing mail-sync phase 5+ work
-7. `docs/followup-optimization-plan.md` only when older followup context is needed
+7. `docs/next-agent-phase-kickoff.md` before starting the next implementation phase
+8. `docs/followup-optimization-plan.md` only when older followup context is needed
 
 `docs/archive/` contains older roadmaps and runbooks. They are preserved for context only.
 
@@ -47,6 +48,8 @@ The target is:
   - `last_heartbeat_at`
   - `attempt_count`
   - atomic `pending -> sending/preparing` claim
+  - single-batch retry from hard `failed -> sending/preparing` when the operator explicitly clicks the failed batch action
+  - retry guard excludes `success-toast-not-found` at both UI and DB claim layers
   - runner heartbeat
   - nonzero runner failure release
   - stale `sending/preparing` recovery on web startup and every minute
@@ -59,6 +62,8 @@ The target is:
 - Phase 5: manifest retired from CRM-owned surfaces
   - dashboard and `/send` read SQLite-backed JSON APIs
   - manifest paths are legacy/debug metadata and runner compatibility inputs
+  - failed work-order batches can be retried from the SQLite-backed `/send` surface through `/batch/send`
+  - `success-toast-not-found` stays excluded from retry because it means send may have succeeded and only verification missed
 
 - Phase 6: production split/send entrypoints internalized
   - split logic lives in `src/sendMailBridge/splitCreators.js`
@@ -85,7 +90,8 @@ The target is:
   - detail opening tries multiple click/navigation strategies and reports `openStrategy`
   - `mail-debug` records sanitized request/response artifacts under `reports/mail-debug/`
   - `/mail-debug` provides a front-end acceptance surface for API discovery runs
-  - Phase 5 DB idempotency is implemented: mail sync stores thread sync status/errors/open strategy, generated message identity, body hashes, and run ids; repeated syncs update existing `mail_messages` rows when identity or body hash matches
+- Phase 5 DB idempotency is implemented: mail sync stores thread sync status/errors/open strategy, generated message identity, body hashes, and run ids; repeated syncs update existing `mail_messages` rows when identity or body hash matches
+  - Phase 4 captured inbox data was cross-checked locally against Phase 5 identity rules: ProBoost `email/receive/list` ids were better than DOM row hashes, and the local SQLite DB was backfilled with API ids/body hashes. Those local DB/report artifacts are intentionally not committed.
 
 ### Not Yet Done
 
@@ -164,6 +170,7 @@ The Phase 3 DB behavior was verified against a temporary SQLite database:
 - runner failure release marks rows failed
 - stale recovery marks timed-out rows failed
 - stale recovery exposes manifest paths for temporary legacy UI compatibility
+- explicit failed-batch retry is compatible with existing claims: `claimSendMailBatch()` accepts `pending` and hard `failed`, while `claimPendingSendMailBatches()` still claims only `pending`; confirmed-but-unverified batches are blocked by the DB claim and are not exposed as retryable.
 
 Previously reported checks were blocked by sandbox/network restrictions:
 
@@ -184,8 +191,10 @@ Mail-sync verification gaps are tracked in `docs/mail-sync-phase4-handoff.md`. I
 - Do not kill the user's normal browser processes.
 - If cleanup is needed, stop only the specific legacy automation `node` process.
 - If a batch is stuck in `sending` or `preparing`, prefer the SQLite stale recovery path over hand-editing JSON.
+- Retry only hard `failed` batches from the UI. Do not retry `success-toast-not-found` / `send-confirmed-verify-missed` without manual review because the email may already have been sent.
 - Remember that `manifest.json` is still a compatibility artifact even though SQLite is the CRM source of truth.
 - For mail-sync risks and verification gaps, read `docs/mail-sync-phase4-handoff.md` before changing runner behavior.
+- For the next phase sequence, start with `docs/next-agent-phase-kickoff.md`.
 
 ## Suggested Next Step
 

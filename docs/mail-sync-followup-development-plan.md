@@ -4,12 +4,13 @@ This plan turns the current ready-followup browser script into a durable mail-sy
 
 ## Current Status
 
-Status as of 2026-05-06:
+Status as of 2026-05-08:
 
 - Implemented: current all-in-one `ready-followup` CLI/web action, DOM helper extraction, expanded DOM failure diagnostics, `mail_threads`, `mail_messages`, `analysis_results`, rule classifier, optional LLM classifier wrapper, persistence of opened thread text/classification from the current live browser pass, standalone `mail-sync` using the current DOM detail-opening path, multi-strategy replied mailbox entry, named detail-opening strategies with row diagnostics, sanitized `mail-debug` API discovery artifacts with a web acceptance page, and Phase 5 DB idempotency columns/indexes for mail sync.
+- Verified locally: Phase 4 captured inbox rows were cross-checked against Phase 5 identity rules. ProBoost `email/receive/list` ids are better than DOM row hashes, and the local ignored SQLite DB was backfilled with API ids/body hashes for the 10 captured inbox messages.
 - Not implemented: `classify-mail`, `classificationRunner`, API-backed detail sync, independent actual-registration import, and DB-backed ready-followup execution.
 - Current blocker: discovered ProBoost mail API candidates still need to be wired into `mail-sync`; until then detail body extraction defaults to live DOM navigation.
-- Active next step: API-backed detail sync integration, then independent actual-registration import and DB-backed `classify-mail`.
+- Active next step: API-backed detail sync integration, then independent actual-registration import, DB-backed `classify-mail`, and DB-backed ready-followup. Use `docs/next-agent-phase-kickoff.md` as the execution checklist.
 
 ## 1. Current Problem
 
@@ -376,6 +377,7 @@ Without message identity or body hash, repeated scans can create duplicate `mail
 - Thread fallback prefers URL ids, then normalized body text, then row metadata only when body text is unavailable.
 - `insertMailMessage()` updates an existing row when `provider_message_id` or `(thread_id, body_hash)` matches.
 - `persistThreadSyncFailure()` records failed opens in `mail_threads` for later review.
+- When ProBoost API ids are available from `email/receive/list`, prefer `api:email/receive:<id>` over generated DOM ids.
 
 ## 10. Phase 6: Split Classification from Sending
 

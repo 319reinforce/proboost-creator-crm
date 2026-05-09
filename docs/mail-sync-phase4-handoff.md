@@ -1,6 +1,6 @@
-# Mail Sync Phase 0-4 Handoff
+# Mail Sync Phase 0-5 Handoff
 
-Status as of 2026-05-06. Phase 5 DB idempotency has now landed on top of the Phase 0-4 foundation.
+Status as of 2026-05-08. Phase 5 DB idempotency has landed on top of the Phase 0-4 foundation, and Phase 4 captured inbox data was cross-checked locally against the Phase 5 identity model.
 
 ## What Landed
 
@@ -148,11 +148,18 @@ Phase 5 SQLite idempotency check passed against a temporary database:
 - Successful sync wrote `sync_status = 'body-synced'` and `last_open_strategy`.
 - Failed sync wrote `sync_status = 'failed'` and `last_sync_error`.
 
+Phase 4 captured data cross-check passed locally:
+
+- The captured `email/receive/list` response contained ProBoost-native ids for the same 10 inbox rows that existed in the local SQLite DB.
+- New Phase 5 body hashing produced no duplicate `provider_message_id` or `(thread_id, body_hash)` conflicts.
+- ProBoost `email/receive/list` ids were more stable than the old DOM row hashes and were used to backfill the local ignored SQLite DB.
+- Local backfill/report artifacts were intentionally not committed. Reproduce by reading `reports/mail-debug/<run-id>/responses.json` when available, matching list rows to existing `mail_messages`, and backfilling `provider_thread_id`, `provider_message_id`, `body_hash`, `sync_status`, and `sync_run_id`.
+
 ## Verification Gaps
 
 - A real headed `/mail-debug` run still needs to be performed after ProBoost login is valid.
-- Headless `mail-debug` smoke failed in this environment because Microsoft Edge closed during persistent-profile launch with `kill EPERM`.
-- Local HTTP checks against the started web server were blocked by sandbox/approval timeout, so the `/mail-debug` page needs manual browser inspection.
+- Headless `mail-debug` smoke previously failed in this environment because Microsoft Edge closed during persistent-profile launch with `kill EPERM`.
+- The `/mail-debug` page still needs manual browser inspection after a current web server smoke.
 - API-backed `mail-sync` has not been wired yet; Phase 4 only discovers candidates.
 
 ## Remaining Work

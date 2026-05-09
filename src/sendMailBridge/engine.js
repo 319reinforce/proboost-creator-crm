@@ -2,8 +2,19 @@ const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
 const config = require('../config');
-const { splitScript, autoScript } = require('./paths');
+const {
+  openDb,
+  initDb,
+  upsertSendMailCampaignFromManifest,
+  claimSendMailBatch,
+  claimPendingSendMailBatches,
+  heartbeatSendMailBatches,
+  failClaimedSendMailBatches,
+} = require('../db');
 const { readManifest, writeJson, updateBatchStatus } = require('./manifest');
+const { syncManifestToCrm } = require('./syncToCrm');
+const { ownedAutoScript, prepareRuntimeAutoScript } = require('./runtimeScript');
+const { splitCreators } = require('./splitCreators');
 
 const uploadsDir = path.join(config.rootDir, 'data', 'uploads');
 const batchesDir = path.join(config.rootDir, 'data', 'send-mail-batches');
@@ -28,7 +39,11 @@ function timestamp() {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
 }
 
-function runNode(script, env, logFile) {
+function fallbackTaskRunId(type) {
+  return `${type}-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+}
+
+function runNode(script, env, logFile, options = {}) {
   ensureDir(path.dirname(logFile));
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [script], {
@@ -38,15 +53,84 @@ function runNode(script, env, logFile) {
     });
 
     const stream = fs.createWriteStream(logFile, { flags: 'a' });
+    const heartbeat = typeof options.onHeartbeat === 'function'
+      ? setInterval(() => {
+        try {
+          options.onHeartbeat();
+        } catch (error) {
+          fs.appendFileSync(logFile, `\n[heartbeat-error] ${String(error.stack || error.message || error)}\n`);
+        }
+      }, Number(options.heartbeatIntervalMs || 60_000))
+      : null;
+    if (heartbeat) {
+      heartbeat.unref?.();
+      options.onHeartbeat();
+    }
     child.stdout.pipe(stream);
     child.stderr.pipe(stream);
-    child.on('error', reject);
+    child.on('error', error => {
+      if (heartbeat) clearInterval(heartbeat);
+      reject(error);
+    });
     child.on('exit', code => {
+      if (heartbeat) clearInterval(heartbeat);
       stream.end();
       if (code === 0) resolve({ code, logFile });
       else reject(new Error(`${path.basename(script)} exited with code ${code}; log=${logFile}`));
     });
   });
+}
+
+function withDb(callback) {
+  const db = openDb();
+  try {
+    initDb(db);
+    return callback(db);
+  } finally {
+    db.close();
+  }
+}
+
+function trySyncManifest(manifestPath, logFile) {
+  try {
+    const result = syncManifestToCrm({ manifestPath, logFile });
+    fs.appendFileSync(logFile, `\n[crm-sync] ${JSON.stringify(result)}\n`);
+    return result;
+  } catch (error) {
+    const message = String(error.stack || error.message || error);
+    fs.appendFileSync(logFile, `\n[crm-sync-error] ${message}\n`);
+    return { error: message };
+  }
+}
+
+function tryUpsertManifestState(manifestPath, manifest, logFile) {
+  try {
+    const result = withDb(db => upsertSendMailCampaignFromManifest(db, { manifestPath, manifest, logFile }));
+    if (logFile) fs.appendFileSync(logFile, `\n[db-sync] ${JSON.stringify(result)}\n`);
+    return result;
+  } catch (error) {
+    const message = String(error.stack || error.message || error);
+    if (logFile) fs.appendFileSync(logFile, `\n[db-sync-error] ${message}\n`);
+    return { error: message };
+  }
+}
+
+function markManifestBatchesFailed(manifestPath, batchNumbers, reason) {
+  const manifest = readManifest(manifestPath);
+  if (!manifest || !Array.isArray(manifest.batches)) return manifest;
+  const numbers = new Set(batchNumbers.map(Number));
+  let changed = false;
+  for (const batch of manifest.batches) {
+    if (!numbers.has(Number(batch.batchNumber))) continue;
+    if (!['sending', 'preparing'].includes(batch.status)) continue;
+    updateBatchStatus(manifest, batch.batchNumber, 'failed', {
+      failedAt: new Date().toISOString(),
+      reason,
+    });
+    changed = true;
+  }
+  if (changed) writeJson(manifestPath, manifest);
+  return manifest;
 }
 
 async function splitUploadedFile(filePath, options = {}) {
@@ -57,19 +141,21 @@ async function splitUploadedFile(filePath, options = {}) {
   const manifestPath = path.join(outputDir, 'manifest.json');
   const logFile = path.join(runsDir, `${campaignName}-split.log`);
 
-  await runNode(splitScript, {
-    INPUT_FILE: filePath,
-    OUTPUT_DIR: outputDir,
-    BATCH_SIZE: String(batchSize),
-    MANIFEST_PATH: manifestPath,
-  }, logFile);
+  ensureDir(runsDir);
+  const splitResult = splitCreators({
+    inputFile: filePath,
+    outputDir,
+    batchSize,
+    manifestPath,
+  });
+  fs.writeFileSync(logFile, `${splitResult.log}\n`);
 
-  const manifest = readManifest(manifestPath);
-  if (!manifest) throw new Error(`manifest not found after split: ${manifestPath}`);
+  const manifest = splitResult.manifest;
   manifest.campaignName = campaignName;
   manifest.originalUpload = filePath;
   manifest.splitLog = logFile;
   writeJson(manifestPath, manifest);
+  tryUpsertManifestState(manifestPath, manifest, logFile);
 
   return { campaignName, outputDir, manifestPath, manifest, logFile };
 }
@@ -77,6 +163,19 @@ async function splitUploadedFile(filePath, options = {}) {
 async function runBatch(manifestPath, batchNumber, options = {}) {
   const manifest = readManifest(manifestPath);
   if (!manifest) throw new Error(`manifest not found: ${manifestPath}`);
+  tryUpsertManifestState(manifestPath, manifest, null);
+  const taskRunId = options.taskRunId || fallbackTaskRunId('send-mail-batch');
+  const claimedBy = options.claimedBy || `pid:${process.pid}`;
+  const claim = withDb(db => claimSendMailBatch(db, {
+    manifestPath,
+    batchNumber,
+    taskRunId,
+    claimedBy,
+    prepareOnly: options.prepareOnly,
+  }));
+  if (!claim.claimed) {
+    throw new Error(`batch ${batchNumber} was not claimed: ${claim.reason}`);
+  }
   const batch = manifest.batches.find(item => item.batchNumber === Number(batchNumber));
   if (!batch) throw new Error(`batch not found: ${batchNumber}`);
 
@@ -101,22 +200,55 @@ async function runBatch(manifestPath, batchNumber, options = {}) {
     PAGE_SIZE: String(options.pageSize || 500),
   };
 
-  await runNode(autoScript, env, logFile);
+  const runnableAutoScript = prepareRuntimeAutoScript(ownedAutoScript);
+  const heartbeat = () => withDb(db => heartbeatSendMailBatches(db, {
+    taskRunId,
+    batchNumbers: [Number(batchNumber)],
+  }));
+  try {
+    await runNode(runnableAutoScript, env, logFile, { onHeartbeat: heartbeat });
+  } catch (error) {
+    const latestAfterFailure = markManifestBatchesFailed(manifestPath, [Number(batchNumber)], 'runner-exited-nonzero');
+    if (latestAfterFailure) tryUpsertManifestState(manifestPath, latestAfterFailure, logFile);
+    withDb(db => failClaimedSendMailBatches(db, {
+      taskRunId,
+      batchNumbers: [Number(batchNumber)],
+      reason: 'runner-exited-nonzero',
+    }));
+    throw error;
+  }
+  const crmSync = trySyncManifest(manifestPath, logFile);
+  const latest = readManifest(manifestPath);
+  const dbSync = latest ? tryUpsertManifestState(manifestPath, latest, logFile) : null;
   return {
     manifestPath,
     batchNumber: Number(batchNumber),
-    manifest: readManifest(manifestPath),
+    manifest: latest,
     logFile,
+    crmSync,
+    dbSync,
   };
 }
 
 async function runPending(manifestPath, options = {}) {
   const manifest = readManifest(manifestPath);
   if (!manifest) throw new Error(`manifest not found: ${manifestPath}`);
+  tryUpsertManifestState(manifestPath, manifest, null);
+  const taskRunId = options.taskRunId || fallbackTaskRunId('send-mail-pending');
+  const claimedBy = options.claimedBy || `pid:${process.pid}`;
+  const claim = withDb(db => claimPendingSendMailBatches(db, {
+    manifestPath,
+    taskRunId,
+    claimedBy,
+  }));
+  const claimedNumbers = claim.claimed.map(batch => batch.batchNumber);
+  if (claimedNumbers.length === 0) {
+    if (claim.reason) throw new Error(`pending batches were not claimed: ${claim.reason}`);
+    return [];
+  }
   const pending = manifest.batches
-    .filter(batch => batch.status === 'pending')
+    .filter(batch => claimedNumbers.includes(Number(batch.batchNumber)))
     .sort((a, b) => a.batchNumber - b.batchNumber);
-  if (pending.length === 0) return [];
 
   const runName = `${path.basename(path.dirname(manifestPath))}-pending-${timestamp()}`;
   const logFile = path.join(runsDir, `${runName}.log`);
@@ -134,13 +266,33 @@ async function runPending(manifestPath, options = {}) {
     PAGE_SIZE: String(options.pageSize || 500),
   };
 
-  await runNode(autoScript, env, logFile);
+  const runnableAutoScript = prepareRuntimeAutoScript(ownedAutoScript);
+  const heartbeat = () => withDb(db => heartbeatSendMailBatches(db, {
+    taskRunId,
+    batchNumbers: claimedNumbers,
+  }));
+  try {
+    await runNode(runnableAutoScript, env, logFile, { onHeartbeat: heartbeat });
+  } catch (error) {
+    const latestAfterFailure = markManifestBatchesFailed(manifestPath, claimedNumbers, 'runner-exited-nonzero');
+    if (latestAfterFailure) tryUpsertManifestState(manifestPath, latestAfterFailure, logFile);
+    withDb(db => failClaimedSendMailBatches(db, {
+      taskRunId,
+      batchNumbers: claimedNumbers,
+      reason: 'runner-exited-nonzero',
+    }));
+    throw error;
+  }
+  const crmSync = trySyncManifest(manifestPath, logFile);
   const latest = readManifest(manifestPath);
+  const dbSync = latest ? tryUpsertManifestState(manifestPath, latest, logFile) : null;
   return pending.map(batch => ({
     manifestPath,
     batchNumber: batch.batchNumber,
     logFile,
     manifest: latest,
+    crmSync,
+    dbSync,
   }));
 }
 

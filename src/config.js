@@ -11,11 +11,10 @@ function boolEnv(name, fallback = false) {
 const rootDir = path.resolve(__dirname, '..');
 const sharedAuthRoots = [
   '/Users/depp/proboost-ready-reminder/.proboost-reply-auth',
-  '/Users/depp/send-mail/.proboost-auth',
 ];
 const auth = resolveAuthConfig({ baseDir: rootDir, appName: 'proboost-creator-crm' });
 const sharedAuthRoot = sharedAuthRoots.find(item => fs.existsSync(item));
-if (!process.env.PROBOOST_AUTH_ROOT && sharedAuthRoot) {
+if (boolEnv('PROBOOST_USE_SHARED_AUTH', false) && !process.env.PROBOOST_AUTH_ROOT && sharedAuthRoot) {
   auth.authRoot = sharedAuthRoot;
   auth.userRoot = path.join(sharedAuthRoot, auth.userId);
   auth.profilePath = path.join(auth.userRoot, 'edge-profile');
@@ -28,9 +27,10 @@ module.exports = {
   dbPath: path.resolve(rootDir, process.env.CRM_DB_PATH || 'data/proboost-creator-crm.sqlite'),
   reportDir: path.resolve(rootDir, process.env.REPORT_DIR || 'reports'),
   proboostUrl: process.env.PROBOOST_URL || 'https://mail.proboost.microdata-inc.com/mail',
+  repliedUrl: process.env.REPLIED_URL || '',
   sentUrl: process.env.SENT_URL || 'https://mail.proboost.microdata-inc.com/mail/sent',
   auth,
-  pageSize: Number(process.env.PAGE_SIZE || 100),
+  pageSize: Number(process.env.PAGE_SIZE || 10),
   loginTimeout: Number(process.env.LOGIN_TIMEOUT || 300000),
   pageLoadTimeout: Number(process.env.PAGE_LOAD_TIMEOUT || 60000),
   sendConfirmTimeout: Number(process.env.SEND_CONFIRM_TIMEOUT || 10000),

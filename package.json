@@ -6,26 +6,44 @@
   "scripts": {
     "init": "node src/cli/index.js init",
     "import": "node src/cli/index.js import",
+    "import-registered": "node src/cli/index.js import-registered",
     "list:unused": "node src/cli/index.js list-unused",
     "render": "node src/cli/index.js render-template",
     "report": "node src/cli/index.js report",
     "doctor": "node src/cli/index.js doctor",
     "login": "node src/cli/index.js login",
     "search": "node src/cli/index.js search",
+    "mail-sync": "node src/cli/index.js mail-sync",
+    "mail-debug": "node src/cli/index.js mail-debug",
+    "classify-mail": "node src/cli/index.js classify-mail",
     "remind": "node src/cli/index.js remind",
     "ready-followup": "node src/cli/index.js ready-followup",
     "dev": "node src/web/server.js",
     "web": "node src/web/server.js",
+    "web:build": "vite build",
     "legacy:ready-login": "node src/cli/index.js legacy ready-login",
     "legacy:unused": "node src/cli/index.js legacy unused",
-    "legacy:replied": "node src/cli/index.js legacy replied"
+    "legacy:replied": "node src/cli/index.js legacy replied",
+    "verify:followup": "node scripts/verify-followup.js"
   },
   "dependencies": {
+    "@tanstack/react-table": "^8.21.3",
     "better-sqlite3": "^12.9.0",
     "commander": "^12.1.0",
     "express": "^5.2.1",
+    "lucide-react": "^0.468.0",
     "multer": "^2.1.1",
-    "playwright": "^1.40.0"
+    "playwright": "^1.40.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "recharts": "^3.8.1",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.1.17",
+    "@vitejs/plugin-react": "^5.1.1",
+    "tailwindcss": "^4.1.17",
+    "vite": "^7.2.4"
   },
   "engines": {
     "node": ">=18"

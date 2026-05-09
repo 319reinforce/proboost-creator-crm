@@ -10,10 +10,12 @@ const {
   upsertTaskRun,
   updateTaskRun,
   listTaskRuns,
+  recoverStaleSendMailBatches,
 } = require('../db');
 const { loginInteractively } = require('../automation/session');
-const { runReadyFollowupBatch } = require('../automation/reminderRunner');
-const { listManifestPaths, readManifest } = require('../sendMailBridge/manifest');
+const { runReminderBatch, runReadyFollowupBatch } = require('../automation/reminderRunner');
+const { runMailApiDiscovery, listMailDebugRuns } = require('../automation/mailApiDiscovery');
+const { listManifestPaths, readManifest, updateBatchStatus } = require('../sendMailBridge/manifest');
 const {
   uploadsDir,
   batchesDir,
@@ -32,6 +34,8 @@ ensureDir(batchesDir);
 ensureDir(runsDir);
 const readyFollowupRunsDir = path.join(config.reportDir, 'ready-followups');
 ensureDir(readyFollowupRunsDir);
+const mailDebugRunsDir = path.join(config.reportDir, 'mail-debug');
+ensureDir(mailDebugRunsDir);
 
 const upload = multer({
   dest: uploadsDir,
@@ -44,7 +48,17 @@ const upload = multer({
 const app = express();
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
-app.use('/assets', express.static(path.join(__dirname, 'public')));
+const staticCacheOptions = {
+  maxAge: '1h',
+};
+
+const appBundleCacheOptions = {
+  maxAge: '7d',
+  immutable: true,
+};
+
+app.use('/assets', express.static(path.join(__dirname, 'public'), staticCacheOptions));
+app.use('/app', express.static(path.join(__dirname, 'public', 'app'), appBundleCacheOptions));
 
 const webDb = initDb(openDb());
 webDb.prepare(`
@@ -55,8 +69,50 @@ webDb.prepare(`
       updated_at = CURRENT_TIMESTAMP
   WHERE status = 'running'
 `).run();
+function markRecoveredManifestBatches(recovered) {
+  const byManifest = new Map();
+  for (const batch of recovered) {
+    if (!batch.manifestPath) continue;
+    if (!byManifest.has(batch.manifestPath)) byManifest.set(batch.manifestPath, []);
+    byManifest.get(batch.manifestPath).push(batch.batchNumber);
+  }
+  for (const [manifestPath, batchNumbers] of byManifest.entries()) {
+    const manifest = readManifest(manifestPath);
+    if (!manifest) continue;
+    let changed = false;
+    for (const batchNumber of batchNumbers) {
+      const batch = manifest.batches?.find(item => Number(item.batchNumber) === Number(batchNumber));
+      if (!batch || !['sending', 'preparing'].includes(batch.status)) continue;
+      updateBatchStatus(manifest, batchNumber, 'failed', {
+        failedAt: new Date().toISOString(),
+        reason: 'runner-heartbeat-timeout',
+      });
+      changed = true;
+    }
+    if (changed) writeJson(manifestPath, manifest);
+  }
+}
+
+const recoveredOnStartup = recoverStaleSendMailBatches(webDb);
+markRecoveredManifestBatches(recoveredOnStartup);
+if (recoveredOnStartup.length > 0) {
+  console.log(`[recovery] marked ${recoveredOnStartup.length} stale send-mail batches as failed`);
+}
 const activeJobs = new Map();
 const eventClients = new Set();
+
+const staleBatchRecovery = setInterval(() => {
+  try {
+    const recovered = recoverStaleSendMailBatches(webDb);
+    markRecoveredManifestBatches(recovered);
+    if (recovered.length > 0) {
+      console.log(`[recovery] marked ${recovered.length} stale send-mail batches as failed`);
+    }
+  } catch (error) {
+    console.error(`[recovery-error] ${String(error.stack || error.message || error)}`);
+  }
+}, 60_000);
+staleBatchRecovery.unref?.();
 
 app.get('/events', (req, res) => {
   res.writeHead(200, {
@@ -95,7 +151,7 @@ function startJob({ type, manifestPath, batchNumber, templateName, task }) {
   });
   broadcastJob(job);
   Promise.resolve()
-    .then(task)
+    .then(() => task(job))
     .then(result => {
       job.status = 'finished';
       job.finishedAt = new Date().toISOString();
@@ -161,6 +217,28 @@ function displayPath(value) {
   return fixed.replace(config.rootDir, '.');
 }
 
+function resolveReportArtifact(relativePath) {
+  const cleaned = String(relativePath || '').replace(/^\/+/, '');
+  const resolved = path.resolve(config.rootDir, cleaned);
+  const reportRoot = path.resolve(config.reportDir);
+  if (!resolved.startsWith(`${reportRoot}${path.sep}`) && resolved !== reportRoot) return null;
+  if (!fs.existsSync(resolved) || !fs.statSync(resolved).isFile()) return null;
+  return resolved;
+}
+
+function extractDiagnosticPaths(value) {
+  const text = String(value || '');
+  const matches = text.match(/(?:diagnostic=)?(?:\.?\/)?reports\/dom-failures\/[^\s;'"<>]+\.json|\/[^\s;'"<>]*reports\/dom-failures\/[^\s;'"<>]+\.json/g) || [];
+  return [...new Set(matches.map(item => item.replace(/^diagnostic=/, '')))]
+    .map(item => item.startsWith('/') ? item : path.resolve(config.rootDir, item.replace(/^\.\//, '')));
+}
+
+function renderDiagnosticLinks(value) {
+  const paths = extractDiagnosticPaths(value);
+  if (paths.length === 0) return '';
+  return `<div class="muted">诊断 JSON：${paths.map(item => `<code>${escapeHtml(displayPath(item))}</code>`).join(' ')}</div>`;
+}
+
 function readTail(filePath, maxLines = 18) {
   if (!filePath || !fs.existsSync(filePath)) return '';
   const lines = fs.readFileSync(filePath, 'utf8').trimEnd().split(/\r?\n/);
@@ -206,6 +284,214 @@ function hasRunningJob(type) {
   return [...activeJobs.values()].some(job => job.type === type && job.status === 'running');
 }
 
+function parseIdList(value) {
+  const items = Array.isArray(value) ? value : String(value || '').split(',');
+  return [...new Set(items
+    .map(item => Number.parseInt(item, 10))
+    .filter(Number.isFinite))];
+}
+
+function creatorActivationClauses(query = {}) {
+  const clauses = [];
+  const params = {};
+  const q = String(query.q || '').trim().toLowerCase();
+  const campaign = String(query.campaign || '').trim();
+
+  if (campaign) {
+    clauses.push('ca.name = @campaign');
+    params.campaign = campaign;
+  }
+  if (q) {
+    clauses.push(`(
+      LOWER(c.handle) LIKE @q
+      OR LOWER(COALESCE(c.display_name, '')) LIKE @q
+      OR LOWER(i.code) LIKE @q
+    )`);
+    params.q = `%${q}%`;
+  }
+
+  return { clauses, params };
+}
+
+function listCreatorActivationRows(db, query = {}) {
+  const limit = Math.min(Number.parseInt(query.limit || '80', 10) || 80, 250);
+  const offset = Math.max(Number.parseInt(query.offset || '0', 10) || 0, 0);
+  const { clauses, params } = creatorActivationClauses(query);
+  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+  const rows = db.prepare(`
+    WITH latest_activation AS (
+      SELECT
+        invite_code_id,
+        MAX(id) AS event_id
+      FROM creator_activation_events
+      GROUP BY invite_code_id
+    ),
+    latest_send AS (
+      SELECT
+        invite_code_id,
+        MAX(id) AS send_log_id
+      FROM send_logs
+      WHERE invite_code_id IS NOT NULL
+      GROUP BY invite_code_id
+    )
+    SELECT
+      c.id AS creatorId,
+      c.handle,
+      c.display_name AS displayName,
+      c.status AS creatorStatus,
+      i.id AS inviteCodeId,
+      i.code AS inviteCode,
+      i.status AS inviteStatus,
+      i.pushed_at AS sentAt,
+      i.registered_at AS registeredAt,
+      ca.name AS campaign,
+      ae.source AS activationSource,
+      ae.activated_at AS activatedAt,
+      ae.operator_note AS operatorNote,
+      ae.task_run_id AS activationTaskRunId,
+      sl.status AS lastSecondTouchStatus,
+      sl.created_at AS lastSecondTouchAt,
+      sl.run_id AS lastSecondTouchRunId,
+      CASE
+        WHEN i.status = 'used'
+          OR c.status IN ('registered', 'used')
+          OR ae.id IS NOT NULL
+        THEN 1 ELSE 0
+      END AS isActivated
+    FROM invite_codes i
+    JOIN creators c ON c.id = i.creator_id
+    JOIN campaigns ca ON ca.id = i.campaign_id
+    LEFT JOIN latest_activation la ON la.invite_code_id = i.id
+    LEFT JOIN creator_activation_events ae ON ae.id = la.event_id
+    LEFT JOIN latest_send ls ON ls.invite_code_id = i.id
+    LEFT JOIN send_logs sl ON sl.id = ls.send_log_id
+    ${where}
+    ORDER BY isActivated ASC, COALESCE(i.pushed_at, i.created_at) DESC, c.handle ASC
+    LIMIT @limit OFFSET @offset
+  `).all({ ...params, limit, offset });
+
+  const normalized = rows.map(row => ({
+    ...row,
+    isActivated: Boolean(row.isActivated),
+    activationSource: row.activationSource || (row.inviteStatus === 'used' || ['registered', 'used'].includes(row.creatorStatus) ? 'activation-import' : ''),
+    activatedAt: row.activatedAt || row.registeredAt || '',
+    sentAt: row.sentAt || '',
+    lastSecondTouchAt: row.lastSecondTouchAt || '',
+    lastSecondTouchStatus: row.lastSecondTouchStatus || '',
+  }));
+
+  return normalized;
+}
+
+function creatorActivationPayload(query = {}) {
+  const rows = listCreatorActivationRows(webDb, query);
+  const pending = rows.filter(row => !row.isActivated);
+  const activated = rows.filter(row => row.isActivated);
+  const filters = {
+    campaigns: webDb.prepare('SELECT name FROM campaigns ORDER BY name ASC').all().map(row => row.name),
+  };
+  const summaryRow = webDb.prepare(`
+    SELECT
+      COUNT(*) AS total,
+      SUM(CASE WHEN i.status = 'used' OR c.status IN ('registered', 'used') OR ae.id IS NOT NULL THEN 1 ELSE 0 END) AS activated
+    FROM invite_codes i
+    JOIN creators c ON c.id = i.creator_id
+    LEFT JOIN (
+      SELECT invite_code_id, MAX(id) AS id
+      FROM creator_activation_events
+      GROUP BY invite_code_id
+    ) ae ON ae.invite_code_id = i.id
+  `).get();
+  const total = summaryRow?.total || 0;
+  const activatedCount = summaryRow?.activated || 0;
+  return {
+    pending,
+    activated,
+    summary: {
+      total,
+      pending: Math.max(total - activatedCount, 0),
+      activated: activatedCount,
+      returned: rows.length,
+    },
+    filters,
+  };
+}
+
+function markCreatorsActivated(db, { creatorIds = [], inviteCodeIds = [], note = '', taskRunId = '' } = {}) {
+  const ids = parseIdList(inviteCodeIds);
+  const creators = parseIdList(creatorIds);
+  if (ids.length === 0 && creators.length === 0) {
+    throw new Error('Select at least one creator or invite code.');
+  }
+
+  const clauses = [];
+  const params = {};
+  if (ids.length > 0) {
+    clauses.push(`i.id IN (${ids.map((_, index) => `@invite${index}`).join(', ')})`);
+    ids.forEach((id, index) => { params[`invite${index}`] = id; });
+  }
+  if (creators.length > 0) {
+    clauses.push(`c.id IN (${creators.map((_, index) => `@creator${index}`).join(', ')})`);
+    creators.forEach((id, index) => { params[`creator${index}`] = id; });
+  }
+
+  const rows = db.prepare(`
+    SELECT i.id AS inviteCodeId, i.creator_id AS creatorId
+    FROM invite_codes i
+    JOIN creators c ON c.id = i.creator_id
+    WHERE ${clauses.join(' OR ')}
+  `).all(params);
+
+  const now = new Date().toISOString();
+  const updateInvite = db.prepare(`
+    UPDATE invite_codes
+    SET status = 'used',
+        registered_at = COALESCE(registered_at, @now),
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = @inviteCodeId
+  `);
+  const updateCreator = db.prepare(`
+    UPDATE creators
+    SET status = 'registered',
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = @creatorId
+  `);
+  const insertEvent = db.prepare(`
+    INSERT INTO creator_activation_events (
+      creator_id,
+      invite_code_id,
+      source,
+      activated_at,
+      operator_note,
+      task_run_id
+    )
+    VALUES (
+      @creatorId,
+      @inviteCodeId,
+      'manual',
+      @now,
+      @note,
+      @taskRunId
+    )
+  `);
+
+  db.transaction(() => {
+    for (const row of rows) {
+      updateInvite.run({ inviteCodeId: row.inviteCodeId, now });
+      updateCreator.run({ creatorId: row.creatorId });
+      insertEvent.run({
+        creatorId: row.creatorId,
+        inviteCodeId: row.inviteCodeId,
+        now,
+        note: note || null,
+        taskRunId: taskRunId || null,
+      });
+    }
+  })();
+
+  return rows;
+}
+
 function summarizeLog(filePath) {
   if (!filePath || !fs.existsSync(filePath)) return '还没有进程输出。';
   const name = path.basename(filePath);
@@ -244,6 +530,118 @@ function summarizeManifest(manifest) {
     total: batches.length,
     totalRows: batches.reduce((sum, batch) => sum + Number(batch.rowCount || 0), 0),
     ...counts,
+  };
+}
+
+function summarizeSendMailBatchRows(rows) {
+  const counts = rows.reduce((acc, batch) => {
+    const status = batch.status || 'pending';
+    acc[status] = (acc[status] || 0) + 1;
+    if (batch.reason === 'success-toast-not-found') acc.confirmedButUnverified += 1;
+    if (Number(batch.selected_count || 0) > 0) acc.selected += Number(batch.selected_count || 0);
+    return acc;
+  }, { pending: 0, sent: 0, failed: 0, sending: 0, prepared: 0, preparing: 0, confirmedButUnverified: 0, selected: 0 });
+  return {
+    total: rows.length,
+    totalRows: rows.reduce((sum, batch) => sum + Number(batch.row_count || 0), 0),
+    ...counts,
+  };
+}
+
+function sendMailSummaryFromSqlite() {
+  const campaignCount = webDb.prepare('SELECT COUNT(*) AS count FROM send_mail_campaigns').get();
+  const row = webDb.prepare(`
+    SELECT
+      COUNT(*) AS batches,
+      COALESCE(SUM(row_count), 0) AS rows,
+      COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0) AS pending,
+      COALESCE(SUM(CASE WHEN status = 'sent' THEN 1 ELSE 0 END), 0) AS sent,
+      COALESCE(SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END), 0) AS failed,
+      COALESCE(SUM(CASE WHEN status = 'prepared' THEN 1 ELSE 0 END), 0) AS prepared,
+      COALESCE(SUM(CASE WHEN status IN ('sending', 'preparing') THEN 1 ELSE 0 END), 0) AS sending,
+      COALESCE(SUM(CASE WHEN reason = 'success-toast-not-found' THEN 1 ELSE 0 END), 0) AS unverified,
+      COALESCE(SUM(COALESCE(selected_count, 0)), 0) AS selected
+    FROM send_mail_batches
+  `).get();
+  return {
+    workOrders: Number(campaignCount?.count || 0),
+    batches: Number(row?.batches || 0),
+    rows: Number(row?.rows || 0),
+    pending: Number(row?.pending || 0),
+    sent: Number(row?.sent || 0),
+    failed: Number(row?.failed || 0),
+    prepared: Number(row?.prepared || 0),
+    sending: Number(row?.sending || 0),
+    unverified: Number(row?.unverified || 0),
+    selected: Number(row?.selected || 0),
+  };
+}
+
+function sendWorkOrdersPayload(pageNumber = 1) {
+  const pageSize = 2;
+  const totalRow = webDb.prepare('SELECT COUNT(*) AS count FROM send_mail_campaigns').get();
+  const totalItems = Number(totalRow?.count || 0);
+  const totalPages = Math.max(Math.ceil(totalItems / pageSize), 1);
+  const currentPage = clampPage(pageNumber, totalPages);
+  const campaigns = webDb.prepare(`
+    SELECT *
+    FROM send_mail_campaigns
+    ORDER BY updated_at DESC, id DESC
+    LIMIT ? OFFSET ?
+  `).all(pageSize, (currentPage - 1) * pageSize);
+  const batchesForCampaign = webDb.prepare(`
+    SELECT *
+    FROM send_mail_batches
+    WHERE send_mail_campaign_id = ?
+    ORDER BY batch_number ASC
+  `);
+  const jobs = recentTaskRuns(null, 50);
+  const workOrders = campaigns.map(campaign => {
+    const batches = batchesForCampaign.all(campaign.id);
+    const summary = summarizeSendMailBatchRows(batches);
+    const active = jobs.filter(job => job.manifestPath === campaign.manifest_path && job.status === 'running');
+    const latestLog = findLatestLog(campaign.name);
+    return {
+      id: campaign.id,
+      campaignName: fixMojibake(campaign.name),
+      sourceFile: displayPath(campaign.input_file || campaign.original_upload || ''),
+      manifestPath: displayPath(campaign.manifest_path || ''),
+      rawManifestPath: campaign.manifest_path || '',
+      status: campaign.status || 'pending',
+      summary,
+      activeJobs: active.map(job => ({
+        id: job.id,
+        type: job.type,
+        status: job.status,
+        startedAt: job.startedAt,
+      })),
+      latestLog: latestLog ? {
+        name: fixMojibake(latestLog.name),
+        href: `/logs/${encodeURIComponent(latestLog.name)}`,
+        summary: summarizeLog(latestLog.filePath),
+      } : null,
+      batches: batches.map(batch => ({
+        id: batch.id,
+        batchNumber: batch.batch_number,
+        fileName: path.basename(fixMojibake(batch.file_path || '')),
+        rowCount: batch.row_count || 0,
+        selectedCount: batch.selected_count,
+        status: batch.status || 'pending',
+        label: statusLabel(batch),
+        reason: batch.reason || '',
+        attemptCount: batch.attempt_count || 0,
+        claimedBy: batch.claimed_by || '',
+        lastHeartbeatAt: batch.last_heartbeat_at || '',
+      })),
+    };
+  });
+  return {
+    page: currentPage,
+    pageSize,
+    totalItems,
+    totalPages,
+    summary: sendMailSummaryFromSqlite(),
+    workOrders,
   };
 }
 
@@ -315,7 +713,7 @@ function renderWorkOrders(pageNumber = 1) {
         <td>${escapeHtml(path.basename(fixMojibake(batch.file || '')))}</td>
         <td>${escapeHtml(batch.rowCount || 0)}</td>
         <td>${escapeHtml(batch.selectedCount ?? '-')}</td>
-        <td><span class="status ${batch.reason === 'success-toast-not-found' ? 'failed' : escapeHtml(batch.status || '')}">${escapeHtml(statusLabel(batch))}</span></td>
+        <td><span class="status ${batch.reason === 'success-toast-not-found' ? 'prepared' : escapeHtml(batch.status || '')}">${escapeHtml(statusLabel(batch))}</span></td>
         <td>${escapeHtml(batch.reason || '')}</td>
       </tr>`).join('');
 
@@ -405,11 +803,13 @@ function renderInboxClassification() {
   }).join('');
 
   const summary = result ? `<div class="stats">
+    <span class="metric"><strong>${result.syncMode === 'incremental' ? '增量' : '全量'}</strong> 模式</span>
     <span class="metric"><strong data-followup-metric="scannedRows">${result.scannedRows || 0}</strong> 列表行</span>
     <span class="metric"><strong data-followup-metric="processed">${result.processed || 0}</strong> 已检查</span>
     <span class="metric"><strong data-followup-metric="opened">${result.opened || 0}</strong> 已点开</span>
     <span class="metric"><strong data-followup-metric="threadRead">${result.threadRead || 0}</strong> 已读正文</span>
     <span class="metric"><strong data-followup-metric="openFailed">${result.openFailed || 0}</strong> 点开失败</span>
+    <span class="metric"><strong data-followup-metric="skippedKnown">${result.skippedKnown || 0}</strong> 已知停止</span>
     <span class="metric"><strong data-followup-metric="readyCount">${result.readyCount || 0}</strong> ready</span>
     <span class="metric"><strong data-followup-metric="whatsappFollowups">${result.whatsappFollowups || 0}</strong> 联系方式跟进</span>
     <span class="metric"><strong data-followup-metric="registerFollowups">${result.registerFollowups || 0}</strong> 注册提醒</span>
@@ -424,17 +824,11 @@ function renderInboxClassification() {
     <td><span class="status ${job.status === 'failed' ? 'hard-failed' : job.status === 'finished' ? 'sent' : 'prepared'}">${escapeHtml(job.status)}</span></td>
     <td>${escapeHtml(job.templateName || '-')}</td>
     <td>${escapeHtml(job.finishedAt || '-')}</td>
-    <td>${job.error ? `<details><summary>错误</summary><pre>${escapeHtml(job.error)}</pre></details>` : escapeHtml(job.result?.runId || job.runId || '-')}</td>
+    <td>${job.error ? `<details><summary>错误</summary>${renderDiagnosticLinks(job.error)}<pre>${escapeHtml(job.error)}</pre></details>` : escapeHtml(job.result?.runId || job.runId || '-')}</td>
   </tr>`).join('');
 
-  return `<section id="inbox-classifier">
-    <h2>收件箱分类与二次触达</h2>
-    <form method="post" action="/inbox/ready-followup">
+  const commonFields = `
       <div class="grid">
-        <div>
-          <label>扫描页数</label>
-          <input name="maxPages" type="number" min="1" value="1" />
-        </div>
         <div>
           <label>检查封数上限</label>
           <input name="limit" type="number" min="0" value="10" />
@@ -456,21 +850,131 @@ function renderInboxClassification() {
           <input name="registeredNames" placeholder="逗号分隔 handle 或名字" />
         </div>
       </div>
-      <p class="muted">默认只 dry-run：打开已回复收件箱、逐封读取正文、判断 ready/联系方式/邀请码，并记录推荐动作。勾选真实发送才会回复邮件。</p>
-      <p class="muted">当前登录态：${escapeHtml(config.auth.profilePath)}。如果需要登录，先打开登录窗口，完成登录后窗口会自动关闭并保存登录态。</p>
+      <p class="muted">默认 dry-run：打开已回复收件箱、读取正文、判断 ready/联系方式/邀请码，并记录推荐动作。勾选真实发送才会回复邮件。</p>
       <label class="row" style="display:inline-flex; margin:0 12px 0 0">
         <input name="send" type="checkbox" value="1" style="width:auto" />
         真实发送二次触达
       </label>
-      <button type="submit">开始检查收件箱</button>
-    </form>
+  `;
+
+  const creatorManagement = `
+    <div id="creator-management" class="creator-management" data-creator-management>
+      <div class="creator-management-head">
+        <div>
+          <h3>达人管理</h3>
+          <p class="muted">左侧是已推送邀请码但未确认激活的达人；右侧是已激活或已手动标记使用的达人。</p>
+        </div>
+        <div class="creator-summary" aria-live="polite">
+          <span><strong data-creator-summary="pending">0</strong> 待推进</span>
+          <span><strong data-creator-summary="activated">0</strong> 已激活</span>
+        </div>
+      </div>
+      <div class="creator-filters">
+        <label>
+          搜索达人/邀请码
+          <input data-creator-filter="q" placeholder="handle / name / invite code" />
+        </label>
+        <label>
+          Campaign
+          <select data-creator-filter="campaign">
+            <option value="">全部 campaign</option>
+          </select>
+        </label>
+        <label class="checkbox-line">
+          <input data-creator-filter="pendingOnly" type="checkbox" checked />
+          只看待推进
+        </label>
+        <button class="secondary compact" type="button" data-creator-action="refresh">刷新</button>
+      </div>
+      <div class="creator-actions">
+        <button class="secondary" type="button" data-creator-action="activate">转移到右侧已激活</button>
+        <label>
+          二次触达模板
+          <input data-creator-template value="督促产品使用" />
+        </label>
+        <label class="checkbox-line">
+          <input data-creator-send type="checkbox" />
+          真实发送
+        </label>
+        <button type="button" data-creator-action="second-touch">推动指定人的二次触达</button>
+        <input data-creator-note placeholder="操作备注" />
+      </div>
+      <p class="muted creator-action-result" data-creator-result>默认 dry-run；勾选真实发送才会回复邮件。</p>
+      <div class="creator-panes">
+        <div class="creator-pane">
+          <div class="pane-heading">
+            <h4>已推送邀请码</h4>
+            <span data-creator-count="pending">0</span>
+          </div>
+          <div class="batch-box creator-table-wrap">
+            <table>
+              <thead><tr><th>选择</th><th>达人</th><th>邀请码</th><th>Campaign</th><th>推送时间</th><th>最近状态</th><th>上次触达</th></tr></thead>
+              <tbody data-creator-rows="pending"><tr><td colspan="7">加载中...</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="creator-pane">
+          <div class="pane-heading">
+            <h4>已激活/已使用</h4>
+            <span data-creator-count="activated">0</span>
+          </div>
+          <div class="batch-box creator-table-wrap">
+            <table>
+              <thead><tr><th>达人</th><th>邀请码</th><th>激活时间</th><th>来源</th><th>备注/审计</th></tr></thead>
+              <tbody data-creator-rows="activated"><tr><td colspan="5">加载中...</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+  `;
+
+  return `<section id="inbox-classifier">
+    <h2>收件箱分类与二次触达</h2>
+    <div class="followup-modes">
+      <form method="post" action="/inbox/ready-followup" class="followup-mode">
+        <input type="hidden" name="syncMode" value="backfill" />
+        <div class="mode-heading">
+          <span class="mode-kicker">一次性基线</span>
+          <h3>全量历史收件箱回填</h3>
+          <p class="muted">第一次使用时跑它，把历史已回复邮件读入本地库。可扫多页；不会因为遇到已知邮件而停。</p>
+        </div>
+        <div class="grid mode-grid">
+          <div>
+            <label>历史扫描页数</label>
+            <input name="maxPages" type="number" min="1" value="20" />
+          </div>
+        </div>
+        ${commonFields}
+        <button type="submit">开始全量回填</button>
+      </form>
+      <form method="post" action="/inbox/ready-followup" class="followup-mode is-incremental">
+        <input type="hidden" name="syncMode" value="incremental" />
+        <div class="mode-heading">
+          <span class="mode-kicker">日常巡检</span>
+          <h3>增量检测新邮件</h3>
+          <p class="muted">每天跑它，只处理最新未入库邮件；遇到第一封已知邮件后自动停止，避免重复检查历史。</p>
+        </div>
+        <div class="grid mode-grid">
+          <div>
+            <label>最多向后检查页数</label>
+            <input name="maxPages" type="number" min="1" value="3" />
+          </div>
+        </div>
+        ${commonFields}
+        <button type="submit">只检测新邮件</button>
+      </form>
+    </div>
+    <p class="muted">当前登录态：${escapeHtml(config.auth.profilePath)}。如果需要登录，先打开登录窗口，完成登录后窗口会自动关闭并保存登录态。</p>
     <form method="post" action="/auth/login" style="margin-top:10px">
       <button class="secondary" type="submit">登录并保存 ProBoost 状态</button>
     </form>
+    ${creatorManagement}
     ${latest ? `<details open style="margin-top:16px">
       <summary>最近一次分类结果</summary>
       <div id="followup-summary">${summary}</div>
       <p id="followup-running" class="muted" ${latest.status === 'running' ? '' : 'hidden'}>后台正在检查收件箱，等待实时结果。</p>
+      <div id="followup-diagnostics">${renderDiagnosticLinks(latest.error || '')}</div>
       <pre id="followup-error" ${latest.error ? '' : 'hidden'}>${escapeHtml(latest.error || '')}</pre>
       ${rows ? `<div class="batch-box"><table>
         <thead><tr><th>发件人</th><th>主题</th><th>意图</th><th>推荐动作</th><th>联系方式</th><th>邀请码</th><th>模板</th><th>阶段</th><th>正文字符</th><th>错误</th></tr></thead>
@@ -488,6 +992,39 @@ function renderInboxClassification() {
 }
 
 function renderSendPage(pageNumber) {
+  const dashboardBundle = path.join(__dirname, 'public', 'app', 'assets', 'main.js');
+  if (fs.existsSync(dashboardBundle)) {
+    return `
+      <section>
+        <h2>上传并拆分 xlsx</h2>
+        <datalist id="template-options">
+          <option value="0414新规模板"></option>
+          <option value="0421三图模板"></option>
+        </datalist>
+        <form method="post" action="/upload" enctype="multipart/form-data">
+          <div class="grid">
+            <div>
+              <label>本地 xlsx 文件，可多选</label>
+              <input name="files" type="file" accept=".xlsx" multiple required />
+            </div>
+            <div>
+              <label>每批人数</label>
+              <input name="batchSize" type="number" min="1" value="200" />
+            </div>
+            <div>
+              <label>任务名前缀</label>
+              <input name="campaignPrefix" value="proboost" />
+            </div>
+          </div>
+          <p class="muted">上传后只生成批次和 manifest；不会发送。发送动作需要在下方逐批点击。</p>
+          <button type="submit">上传拆分</button>
+        </form>
+      </section>
+      <link rel="stylesheet" href="/app/assets/main.css" />
+      <div id="send-root" data-page="${escapeHtml(pageNumber || 1)}"></div>
+      <script type="module" src="/app/assets/main.js"></script>
+    `;
+  }
   return `
     <section>
       <h2>上传并拆分 xlsx</h2>
@@ -519,43 +1056,66 @@ function renderSendPage(pageNumber) {
 }
 
 function renderDashboard() {
-  const manifests = listManifestPaths(batchesDir)
-    .map(manifestPath => readManifest(manifestPath))
-    .filter(Boolean);
-  const sendSummary = manifests.reduce((acc, manifest) => {
-    const summary = summarizeManifest(manifest);
-    acc.workOrders += 1;
-    acc.batches += summary.total;
-    acc.rows += summary.totalRows;
-    acc.pending += summary.pending;
-    acc.sent += summary.sent;
-    acc.unverified += summary.confirmedButUnverified;
+  const dashboardBundle = path.join(__dirname, 'public', 'app', 'assets', 'main.js');
+  if (!fs.existsSync(dashboardBundle)) {
+    return `<section>
+      <h2>数据看板前端应用尚未构建</h2>
+      <p class="muted">Dashboard 已迁移为 React/Vite 应用。安装前端依赖后运行 <code>npm run web:build</code>，刷新本页即可加载新版看板。</p>
+      <pre>${escapeHtml(JSON.stringify(dashboardPayload(), null, 2))}</pre>
+    </section>`;
+  }
+  return `<link rel="stylesheet" href="/app/assets/main.css" />
+    <div id="dashboard-root"></div>
+    <script type="module" src="/app/assets/main.js"></script>`;
+}
+
+function dashboardPayload() {
+  const sendSummary = sendMailSummaryFromSqlite();
+  const bridgeRows = webDb.prepare(`
+    SELECT status, COUNT(*) AS count
+    FROM send_logs
+    WHERE external_source = 'sendMailBridge'
+    GROUP BY status
+  `).all();
+  const bridgeSummary = bridgeRows.reduce((acc, row) => {
+    acc.total += Number(row.count || 0);
+    acc[row.status] = Number(row.count || 0);
     return acc;
-  }, { workOrders: 0, batches: 0, rows: 0, pending: 0, sent: 0, unverified: 0 });
+  }, { total: 0 });
+  const sqliteCampaigns = webDb.prepare('SELECT COUNT(*) AS count FROM send_mail_campaigns').get();
+  const sqliteBatches = webDb.prepare(`
+    SELECT status, COUNT(*) AS count
+    FROM send_mail_batches
+    GROUP BY status
+  `).all();
+  const sqliteSummary = sqliteBatches.reduce((acc, row) => {
+    acc.batches += Number(row.count || 0);
+    acc[row.status] = Number(row.count || 0);
+    return acc;
+  }, { campaigns: Number(sqliteCampaigns?.count || 0), batches: 0 });
   const reports = listReadyFollowupReports();
   const latest = reports[0]?.payload;
-  return `<section>
-    <h2>数据看板</h2>
-    <div class="stats">
-      <span class="metric"><strong>${sendSummary.workOrders}</strong> 发信工单</span>
-      <span class="metric"><strong>${sendSummary.batches}</strong> 批次</span>
-      <span class="metric"><strong>${sendSummary.rows}</strong> 达人行数</span>
-      <span class="metric"><strong>${sendSummary.pending}</strong> 待发送</span>
-      <span class="metric"><strong>${sendSummary.unverified}</strong> 已确认待复核</span>
-      <span class="metric"><strong>${reports.length}</strong> 二次触达运行</span>
-    </div>
-    ${latest ? `<details open style="margin-top:16px">
-      <summary>最近二次触达</summary>
-      <div class="stats">
-        <span class="metric"><strong>${escapeHtml(latest.status)}</strong> 状态</span>
-        <span class="metric"><strong>${latest.result?.processed || 0}</strong> 已检查</span>
-        <span class="metric"><strong>${latest.result?.readyCount || 0}</strong> ready</span>
-        <span class="metric"><strong>${latest.result?.whatsappFollowups || 0}</strong> 联系方式跟进</span>
-        <span class="metric"><strong>${latest.result?.registerFollowups || 0}</strong> 注册提醒</span>
-      </div>
-      ${latest.error ? `<pre>${escapeHtml(latest.error)}</pre>` : ''}
-    </details>` : '<p class="muted">还没有二次触达运行记录。</p>'}
-  </section>`;
+  return {
+    sendSummary,
+    bridgeSummary,
+    bridgeRows: bridgeRows
+      .map(row => ({
+        status: row.status,
+        label: row.status || '-',
+        count: Number(row.count || 0),
+      }))
+      .sort((a, b) => b.count - a.count),
+    sqliteSummary,
+    latestFollowup: latest ? {
+      id: latest.id || '',
+      status: latest.status || '',
+      startedAt: latest.startedAt || '',
+      finishedAt: latest.finishedAt || '',
+      error: latest.error || '',
+      result: latest.result || null,
+    } : null,
+    followupRuns: reports.length,
+  };
 }
 
 function followupSummaryPayload() {
@@ -575,22 +1135,26 @@ function followupSummaryPayload() {
       templateName: latest.templateName || '',
     } : null,
     result: result ? {
+      syncMode: result.syncMode || 'backfill',
       scannedRows: result.scannedRows || 0,
       processed: result.processed || 0,
       opened: result.opened || 0,
       threadRead: result.threadRead || 0,
       openFailed: result.openFailed || 0,
+      skippedKnown: result.skippedKnown || 0,
       readyCount: result.readyCount || 0,
       whatsappFollowups: result.whatsappFollowups || 0,
       registerFollowups: result.registerFollowups || 0,
       skippedRegistered: result.skippedRegistered || 0,
       runId: result.runId || '',
     } : {
+      syncMode: 'backfill',
       scannedRows: 0,
       processed: 0,
       opened: 0,
       threadRead: 0,
       openFailed: 0,
+      skippedKnown: 0,
       readyCount: 0,
       whatsappFollowups: 0,
       registerFollowups: 0,
@@ -618,8 +1182,145 @@ function followupSummaryPayload() {
       templateName: job.templateName || '',
       runId: job.result?.runId || job.runId || '',
       error: job.error || '',
+      diagnostics: extractDiagnosticPaths(job.error || '').map(displayPath),
     })),
   };
+}
+
+function mailDebugSummaryPayload() {
+  const jobs = recentTaskRuns('mail-debug', 8);
+  const runs = listMailDebugRuns(8).map(item => ({
+    id: item.summary.id || item.name,
+    outDir: displayPath(item.summary.outDir || item.dir),
+    summaryPath: displayPath(item.summary.summaryPath || item.summaryPath),
+    requestPath: displayPath(item.summary.requestPath || ''),
+    responsePath: displayPath(item.summary.responsePath || ''),
+    candidatePath: displayPath(item.summary.candidatePath || ''),
+    mailbox: item.summary.mailbox || '',
+    requestCount: item.summary.requestCount || 0,
+    responseCount: item.summary.responseCount || 0,
+    candidateCount: item.summary.candidateCount || 0,
+    createdAt: item.summary.createdAt || '',
+    rawEnabled: Boolean(item.summary.rawEnabled),
+    candidates: (item.summary.candidates || []).slice(0, 10),
+  }));
+  return {
+    running: jobs.some(job => job.status === 'running'),
+    latestJob: jobs[0] || null,
+    jobs: jobs.map(job => ({
+      id: job.id,
+      status: job.status,
+      startedAt: job.startedAt,
+      finishedAt: job.finishedAt || '',
+      error: job.error || '',
+      result: job.result || null,
+    })),
+    runs,
+  };
+}
+
+function artifactLink(displayedPath) {
+  if (!displayedPath) return '-';
+  const normalized = String(displayedPath).replace(/^\.\//, '');
+  return `<a href="/reports/artifact?path=${encodeURIComponent(normalized)}">${escapeHtml(displayedPath)}</a>`;
+}
+
+function renderCandidateTags(tags = []) {
+  return tags.map(tag => `<span class="status prepared">${escapeHtml(tag)}</span>`).join(' ') || '-';
+}
+
+function renderMailDebugPage() {
+  const payload = mailDebugSummaryPayload();
+  const latest = payload.latestJob;
+  const runs = payload.runs;
+  const latestRun = runs[0];
+  const topCandidates = (latestRun?.candidates || []).slice(0, 8).map(candidate => `<tr>
+    <td>${escapeHtml(candidate.method || 'GET')}</td>
+    <td>${renderCandidateTags(candidate.tags || [])}</td>
+    <td>${escapeHtml((candidate.statuses || []).join(', ') || '-')}</td>
+    <td>${escapeHtml((candidate.contentTypes || []).join(', ') || '-')}</td>
+    <td>${escapeHtml(candidate.url || '-')}</td>
+  </tr>`).join('');
+  const runRows = runs.map(run => `<tr>
+    <td>${escapeHtml(run.createdAt || '-')}</td>
+    <td><span class="status finished">${escapeHtml(run.candidateCount)}</span></td>
+    <td>${escapeHtml(run.requestCount)} / ${escapeHtml(run.responseCount)}</td>
+    <td>${escapeHtml(run.mailbox || '-')}</td>
+    <td>${artifactLink(run.summaryPath)}</td>
+    <td>${artifactLink(run.candidatePath)}</td>
+  </tr>`).join('');
+  const jobRows = payload.jobs.map(job => `<tr>
+    <td>${escapeHtml(job.startedAt || '-')}</td>
+    <td><span class="status ${job.status === 'failed' ? 'hard-failed' : job.status === 'finished' ? 'finished' : 'running'}">${escapeHtml(job.status || '-')}</span></td>
+    <td>${escapeHtml(job.finishedAt || '-')}</td>
+    <td>${job.error ? `<details><summary>错误</summary><pre>${escapeHtml(job.error)}</pre></details>` : escapeHtml(job.result?.id || '-')}</td>
+  </tr>`).join('');
+
+  return `<div id="mail-debug-root"></div>
+  <section class="debug-hero">
+    <div>
+      <h2>邮件 API 验收</h2>
+      <p class="muted">记录 ProBoost 已登录浏览器中的邮件请求，自动筛出 list/detail/reply 候选接口。默认脱敏，不保存 cookies 或 auth headers。</p>
+      <div class="stats">
+        <span class="metric"><strong>${escapeHtml(latestRun?.candidateCount || 0)}</strong> 候选接口</span>
+        <span class="metric"><strong>${escapeHtml(latestRun?.requestCount || 0)}</strong> 请求</span>
+        <span class="metric"><strong>${escapeHtml(latestRun?.responseCount || 0)}</strong> 响应</span>
+        <span class="metric"><strong>${payload.running ? '1' : '0'}</strong> 运行中</span>
+      </div>
+    </div>
+    <form method="post" action="/mail-debug/run" class="debug-runner">
+      <div class="grid">
+        <div>
+          <label>邮箱</label>
+          <select name="mailbox">
+            <option value="replied">已回复</option>
+            <option value="inbox">收件箱</option>
+          </select>
+        </div>
+        <div>
+          <label>记录时长 ms</label>
+          <input name="duration" type="number" min="5000" step="1000" value="45000" />
+        </div>
+        <label class="row" style="align-self:end; margin:0">
+          <input name="openFirstRow" type="checkbox" value="1" />
+          打开第一封邮件
+        </label>
+      </div>
+      <p class="muted">需要捕获详情接口时勾选“打开第一封邮件”。真实发送不会在此页面触发。</p>
+      <p id="mail-debug-running" class="muted" ${payload.running ? '' : 'hidden'}>验收记录正在运行，页面会在任务结束后显示新产物。</p>
+      <button type="submit" ${payload.running ? 'disabled' : ''}>开始验收记录</button>
+      <button class="secondary" type="submit" formaction="/auth/login">登录状态入口</button>
+    </form>
+  </section>
+  ${latest ? `<section>
+    <h2>当前任务</h2>
+    <div class="stats">
+      <span class="metric"><strong>${escapeHtml(latest.status || '-')}</strong> 状态</span>
+      <span class="metric"><strong>${escapeHtml(latest.startedAt || '-')}</strong> 开始</span>
+    </div>
+    ${latest.error ? `<pre>${escapeHtml(latest.error)}</pre>` : ''}
+  </section>` : ''}
+  <section>
+    <h2>最新候选接口</h2>
+    ${topCandidates ? `<div class="batch-box debug-table"><table>
+      <thead><tr><th>方法</th><th>类型</th><th>状态</th><th>Content-Type</th><th>URL</th></tr></thead>
+      <tbody>${topCandidates}</tbody>
+    </table></div>` : '<p class="muted">还没有候选接口。先运行一次验收记录。</p>'}
+  </section>
+  <section>
+    <h2>验收产物</h2>
+    ${runRows ? `<div class="batch-box"><table>
+      <thead><tr><th>时间</th><th>候选</th><th>请求/响应</th><th>邮箱</th><th>Summary</th><th>Candidates</th></tr></thead>
+      <tbody>${runRows}</tbody>
+    </table></div>` : '<p class="muted">暂无产物。</p>'}
+  </section>
+  ${jobRows ? `<section>
+    <h2>最近任务</h2>
+    <div class="batch-box"><table>
+      <thead><tr><th>开始</th><th>状态</th><th>结束</th><th>结果/错误</th></tr></thead>
+      <tbody>${jobRows}</tbody>
+    </table></div>
+  </section>` : ''}`;
 }
 
 app.get('/', (_req, res) => {
@@ -628,6 +1329,114 @@ app.get('/', (_req, res) => {
 
 app.get('/api/followup-summary', (_req, res) => {
   res.json(followupSummaryPayload());
+});
+
+app.get('/api/followup/creators', (req, res, next) => {
+  try {
+    res.json(creatorActivationPayload(req.query));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/followup/creators/activate', (req, res, next) => {
+  try {
+    const inviteCodeIds = parseIdList(req.body.inviteCodeIds);
+    const creatorIds = parseIdList(req.body.creatorIds);
+    if (inviteCodeIds.length === 0 && creatorIds.length === 0) {
+      res.status(400).json({ ok: false, error: 'Select at least one creator.' });
+      return;
+    }
+    const note = String(req.body.note || '').trim();
+    const taskId = `activation_${new Date().toISOString().replace(/[:.]/g, '-')}`;
+    const startedAt = new Date().toISOString();
+    upsertTaskRun(webDb, {
+      id: taskId,
+      type: 'creator-activation',
+      status: 'finished',
+      templateName: 'manual activation',
+      payload: { creatorIds, inviteCodeIds, note },
+      result: null,
+      startedAt,
+      finishedAt: startedAt,
+    });
+    const updatedRows = markCreatorsActivated(webDb, {
+      creatorIds,
+      inviteCodeIds,
+      note,
+      taskRunId: taskId,
+    });
+    updateTaskRun(webDb, taskId, {
+      result: { updated: updatedRows.length },
+    });
+    res.json({
+      ok: true,
+      updated: updatedRows.length,
+      taskRunId: taskId,
+      ...creatorActivationPayload(req.query),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/followup/creators/second-touch', (req, res, next) => {
+  try {
+    if (hasRunningJob('auth-login') || hasRunningJob('creator-second-touch')) {
+      res.status(409).json({ ok: false, error: 'Another login or selected second-touch job is running.' });
+      return;
+    }
+    const inviteCodeIds = parseIdList(req.body.inviteCodeIds);
+    const creatorIds = parseIdList(req.body.creatorIds);
+    if (inviteCodeIds.length === 0 && creatorIds.length === 0) {
+      res.status(400).json({ ok: false, error: 'Select at least one creator.' });
+      return;
+    }
+    const templateName = String(req.body.templateName || '督促产品使用').trim() || '督促产品使用';
+    const send = req.body.send === true || req.body.send === '1' || req.body.send === 'on';
+    const job = startJob({
+      type: 'creator-second-touch',
+      templateName: `${send ? '发送' : 'Dry-run'}：${templateName}`,
+      task: async () => {
+        const db = initDb(openDb());
+        try {
+          return await runReminderBatch(db, {
+            inviteCodeIds,
+            creatorIds,
+            template: templateName,
+            send,
+            keepOpen: false,
+            headless: false,
+          });
+        } finally {
+          db.close();
+        }
+      },
+    });
+    res.json({
+      ok: true,
+      job: {
+        id: job.id,
+        status: job.status,
+        templateName: job.templateName,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/api/mail-debug-summary', (_req, res) => {
+  res.json(mailDebugSummaryPayload());
+});
+
+app.get('/api/dashboard', (_req, res) => {
+  res.json(dashboardPayload());
+});
+
+app.get('/api/send-work-orders', (req, res) => {
+  const pageNumber = Number.parseInt(req.query.page || '1', 10);
+  res.json(sendWorkOrdersPayload(pageNumber));
 });
 
 app.get('/send', (req, res) => {
@@ -639,8 +1448,26 @@ app.get('/followup', (_req, res) => {
   res.send(page('二次触达 - ProBoost Creator CRM', renderInboxClassification(), 'followup'));
 });
 
+app.get('/mail-debug', (_req, res) => {
+  res.send(page('邮件验收 - ProBoost Creator CRM', renderMailDebugPage(), 'mail-debug'));
+});
+
 app.get('/dashboard', (_req, res) => {
   res.send(page('数据看板 - ProBoost Creator CRM', renderDashboard(), 'dashboard'));
+});
+
+app.get('/reports/artifact', (req, res, next) => {
+  try {
+    const filePath = resolveReportArtifact(req.query.path);
+    if (!filePath) {
+      res.status(404).send(page('产物不存在', '<section><h2>产物不存在或不在 reports 目录下</h2></section>', 'mail-debug'));
+      return;
+    }
+    res.type(path.extname(filePath) === '.json' ? 'application/json' : 'text/plain');
+    res.send(fs.readFileSync(filePath, 'utf8'));
+  } catch (error) {
+    next(error);
+  }
 });
 
 app.post('/upload', upload.array('files', 20), async (req, res, next) => {
@@ -675,6 +1502,7 @@ app.post('/upload', upload.array('files', 20), async (req, res, next) => {
 
 function readyFollowupOptionsFromBody(body) {
   return {
+    syncMode: body.syncMode === 'incremental' ? 'incremental' : 'backfill',
     maxPages: body.maxPages || '1',
     limit: body.limit || '10',
     readyKeywords: body.readyKeywords || 'ready',
@@ -702,7 +1530,7 @@ app.post('/inbox/ready-followup', async (req, res, next) => {
         status: 'failed',
         startedAt: new Date().toISOString(),
         finishedAt: new Date().toISOString(),
-        templateName: `${options.templateWhatsapp} / ${options.templateRegister}`,
+        templateName: `${options.syncMode === 'incremental' ? '增量' : '全量'}：${options.templateWhatsapp} / ${options.templateRegister}`,
         options: reportOptions,
         result: null,
         error: 'ProBoost 登录窗口仍在运行。请先在打开的窗口完成登录，等窗口自动关闭并保存登录态后，再开始检查收件箱。',
@@ -712,7 +1540,7 @@ app.post('/inbox/ready-followup', async (req, res, next) => {
     }
     startJob({
       type: 'ready-followup',
-      templateName: `${options.templateWhatsapp} / ${options.templateRegister}`,
+      templateName: `${options.syncMode === 'incremental' ? '增量' : '全量'}：${options.templateWhatsapp} / ${options.templateRegister}`,
       task: async () => {
         const startedAt = new Date().toISOString();
         const writeReport = (payload) => writeJson(reportPath, {
@@ -720,7 +1548,7 @@ app.post('/inbox/ready-followup', async (req, res, next) => {
           status: payload.status,
           startedAt,
           finishedAt: payload.finishedAt || '',
-          templateName: `${options.templateWhatsapp} / ${options.templateRegister}`,
+          templateName: `${options.syncMode === 'incremental' ? '增量' : '全量'}：${options.templateWhatsapp} / ${options.templateRegister}`,
           options: reportOptions,
           result: payload.result || null,
           error: payload.error || '',
@@ -783,6 +1611,34 @@ app.post('/auth/login', async (_req, res, next) => {
   }
 });
 
+function mailDebugOptionsFromBody(body) {
+  return {
+    mailbox: body.mailbox || 'replied',
+    duration: body.duration || '45000',
+    openFirstRow: body.openFirstRow === '1' || body.openFirstRow === 'on',
+    keepOpen: false,
+    headless: false,
+  };
+}
+
+app.post('/mail-debug/run', async (req, res, next) => {
+  try {
+    if (hasRunningJob('mail-debug')) {
+      res.redirect(303, '/mail-debug');
+      return;
+    }
+    const options = mailDebugOptionsFromBody(req.body);
+    startJob({
+      type: 'mail-debug',
+      templateName: `${options.mailbox} discovery`,
+      task: () => runMailApiDiscovery(options),
+    });
+    res.redirect(303, '/mail-debug');
+  } catch (error) {
+    next(error);
+  }
+});
+
 function runOptionsFromBody(body, prepareOnly) {
   return {
     prepareOnly,
@@ -801,7 +1657,11 @@ app.post('/batch/prepare', async (req, res, next) => {
       manifestPath: req.body.manifestPath,
       batchNumber: req.body.batchNumber,
       templateName: options.templateName,
-      task: () => runBatch(req.body.manifestPath, req.body.batchNumber, options),
+      task: job => runBatch(req.body.manifestPath, req.body.batchNumber, {
+        ...options,
+        taskRunId: job.id,
+        claimedBy: `web:${job.id}`,
+      }),
     });
     res.redirect(303, '/send');
   } catch (error) {
@@ -817,7 +1677,11 @@ app.post('/batch/send', async (req, res, next) => {
       manifestPath: req.body.manifestPath,
       batchNumber: req.body.batchNumber,
       templateName: options.templateName,
-      task: () => runBatch(req.body.manifestPath, req.body.batchNumber, options),
+      task: job => runBatch(req.body.manifestPath, req.body.batchNumber, {
+        ...options,
+        taskRunId: job.id,
+        claimedBy: `web:${job.id}`,
+      }),
     });
     res.redirect(303, '/send');
   } catch (error) {
@@ -832,7 +1696,11 @@ app.post('/batch/send-pending', async (req, res, next) => {
       type: 'send-pending',
       manifestPath: req.body.manifestPath,
       templateName: options.templateName,
-      task: () => runPending(req.body.manifestPath, options),
+      task: job => runPending(req.body.manifestPath, {
+        ...options,
+        taskRunId: job.id,
+        claimedBy: `web:${job.id}`,
+      }),
     });
     res.redirect(303, '/send');
   } catch (error) {
@@ -865,6 +1733,9 @@ app.use((error, _req, res, _next) => {
 });
 
 const port = Number(process.env.PORT || 8794);
-app.listen(port, '127.0.0.1', () => {
+const server = app.listen(port, '127.0.0.1', () => {
   console.log(`ProBoost Creator CRM review UI: http://127.0.0.1:${port}`);
+});
+server.on('error', error => {
+  console.error(error.stack || error.message || error);
 });

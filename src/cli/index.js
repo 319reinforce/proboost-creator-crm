@@ -4,11 +4,15 @@ const { Command } = require('commander');
 const config = require('../config');
 const { openDb, initDb } = require('../db');
 const { importCampaign } = require('../importer/importCampaign');
+const { importRegistered } = require('../importer/importRegistered');
 const { listUnusedInvites, getCampaignStats } = require('../importer/queries');
 const { getActiveTemplate, renderTemplate } = require('../templates/render');
 const { exportCampaignReport } = require('../reporting/export');
 const { loginInteractively } = require('../automation/session');
 const { searchHandle, runReminderBatch, runReadyFollowupBatch } = require('../automation/reminderRunner');
+const { runMailSyncBatch } = require('../automation/mailSyncRunner');
+const { runMailApiDiscovery } = require('../automation/mailApiDiscovery');
+const { runClassificationBatch } = require('../automation/classificationRunner');
 const {
   saveLogin: saveLegacyReadyLogin,
   runUnusedInviteReminder,
@@ -94,8 +98,54 @@ program
   });
 
 program
+  .command('mail-sync')
+  .description('Sync ProBoost mail bodies into SQLite without classifying or sending')
+  .option('--mailbox <name>', 'mailbox to sync: replied or inbox', 'replied')
+  .option('--max-pages <n>', 'max mailbox pages to scan', '1')
+  .option('--limit <n>', 'limit messages to inspect', '0')
+  .option('--detail-source <mode>', 'detail source: auto, api, or dom', 'auto')
+  .option('--keep-open', 'keep browser open after run', false)
+  .option('--headless', 'run browser headless', false)
+  .action(async (options) => {
+    await withDb(async (db) => {
+      const result = await runMailSyncBatch(db, options);
+      console.log(JSON.stringify(result, null, 2));
+    });
+  });
+
+program
+  .command('mail-debug')
+  .description('Discover likely ProBoost mail list/detail/reply APIs from an authenticated browser session')
+  .option('--mailbox <name>', 'mailbox to open while recording: replied or inbox', 'replied')
+  .option('--duration <ms>', 'recording duration in milliseconds', '45000')
+  .option('--open-first-row', 'open the first listed row to capture detail API candidates', false)
+  .option('--keep-open', 'keep browser open after recording', false)
+  .option('--headless', 'run browser headless', false)
+  .action(async (options) => {
+    const result = await runMailApiDiscovery(options);
+    console.log(JSON.stringify(result, null, 2));
+  });
+
+program
+  .command('classify-mail')
+  .description('Classify already-synced inbound mail from SQLite without opening a browser or sending')
+  .option('--limit <n>', 'limit messages to classify', '50')
+  .option('--thread-id <id>', 'classify messages from one mail thread')
+  .option('--message-id <id>', 'classify one mail message')
+  .option('--ready-keywords <items>', 'comma-separated ready keywords', 'ready')
+  .option('--registered-names <items>', 'comma-separated names/handles to treat as already registered')
+  .option('--prompt-version <name>', 'classifier prompt/rules version')
+  .action(async (options) => {
+    await withDb(async (db) => {
+      const result = await runClassificationBatch(db, options);
+      console.log(JSON.stringify(result, null, 2));
+    });
+  });
+
+program
   .command('ready-followup')
   .description('Scan replied inbox mail, classify ready replies, and prepare/send second-touch followups')
+  .option('--sync-mode <mode>', 'backfill scans history; incremental stops at the first already-synced message', 'backfill')
   .option('--max-pages <n>', 'max replied inbox pages to scan', '1')
   .option('--limit <n>', 'limit messages to inspect', '0')
   .option('--ready-keywords <items>', 'comma-separated ready keywords', 'ready')
@@ -133,6 +183,21 @@ program
   .action(async (options) => {
     await withDb((db) => {
       const result = importCampaign(db, options);
+      console.log(JSON.stringify(result, null, 2));
+    });
+  });
+
+program
+  .command('import-registered')
+  .description('Import an actual activated/registered creator list and mark matched invite codes used')
+  .requiredOption('--file <path>', 'registered/activated list file (.xlsx, .xls, .csv, or text)')
+  .option('--campaign <name>', 'optional campaign filter for matching')
+  .option('--source <name>', 'activation source label', 'activation-import')
+  .option('--note <text>', 'operator note for activation audit rows', '')
+  .option('--activated-at <iso>', 'activation timestamp to write; defaults to now')
+  .action(async (options) => {
+    await withDb((db) => {
+      const result = importRegistered(db, options);
       console.log(JSON.stringify(result, null, 2));
     });
   });

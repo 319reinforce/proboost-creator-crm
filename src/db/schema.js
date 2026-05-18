@@ -258,6 +258,54 @@ ProBoost Team',
   1,
   1
 );
+
+INSERT OR IGNORE INTO templates (
+  name,
+  purpose,
+  subject_template,
+  body_template,
+  version,
+  is_active
+) VALUES (
+  '5月新规',
+  'send_mail',
+  '5月新规',
+  '5月新规',
+  1,
+  1
+);
+
+INSERT OR IGNORE INTO templates (
+  name,
+  purpose,
+  subject_template,
+  body_template,
+  version,
+  is_active
+) VALUES (
+  '0414新规模板',
+  'send_mail',
+  '0414新规模板',
+  '0414新规模板',
+  1,
+  1
+);
+
+INSERT OR IGNORE INTO templates (
+  name,
+  purpose,
+  subject_template,
+  body_template,
+  version,
+  is_active
+) VALUES (
+  '0421三图模板',
+  'send_mail',
+  '0421三图模板',
+  '0421三图模板',
+  1,
+  1
+);
 `;
 
 module.exports = {

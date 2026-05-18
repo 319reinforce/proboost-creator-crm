@@ -23,6 +23,7 @@ const {
   splitUploadedFile,
   runBatch,
   runPending,
+  runSelected,
 } = require('../sendMailBridge/engine');
 
 function ensureDir(dirPath) {
@@ -56,6 +57,7 @@ const appBundleCacheOptions = {
   maxAge: '7d',
   immutable: true,
 };
+const appAssetVersion = '20260511-bulk-retry-2';
 
 app.use('/assets', express.static(path.join(__dirname, 'public'), staticCacheOptions));
 app.use('/app', express.static(path.join(__dirname, 'public', 'app'), appBundleCacheOptions));
@@ -258,6 +260,96 @@ function readJson(filePath) {
   }
 }
 
+function normalizeTemplatePayload(body = {}) {
+  const name = String(body.name || '').trim();
+  if (!name) throw new Error('模板名不能为空。');
+  const purpose = String(body.purpose || 'send_mail').trim() || 'send_mail';
+  const subjectTemplate = String(body.subjectTemplate || body.subject_template || name).trim() || name;
+  const bodyTemplate = String(body.bodyTemplate || body.body_template || name).trim() || name;
+  return {
+    name,
+    purpose,
+    subjectTemplate,
+    bodyTemplate,
+  };
+}
+
+function listTemplates(db = webDb) {
+  return db.prepare(`
+    SELECT
+      t.id,
+      t.name,
+      t.purpose,
+      t.subject_template AS subjectTemplate,
+      t.body_template AS bodyTemplate,
+      t.version,
+      t.is_active AS isActive,
+      t.created_at AS createdAt,
+      t.updated_at AS updatedAt
+    FROM templates t
+    JOIN (
+      SELECT name, MAX(version) AS version
+      FROM templates
+      WHERE is_active = 1
+      GROUP BY name
+    ) latest ON latest.name = t.name AND latest.version = t.version
+    WHERE t.is_active = 1
+    ORDER BY
+      CASE WHEN t.name = '5月新规' THEN 0 ELSE 1 END,
+      t.updated_at DESC,
+      t.name ASC,
+      t.version DESC
+  `).all().map(row => ({
+    ...row,
+    isActive: Boolean(row.isActive),
+  }));
+}
+
+function createTemplate(db, payload) {
+  const template = normalizeTemplatePayload(payload);
+  const latest = db.prepare(`
+    SELECT COALESCE(MAX(version), 0) AS version
+    FROM templates
+    WHERE name = ?
+  `).get(template.name);
+  const version = Number(latest?.version || 0) + 1;
+  const result = db.prepare(`
+    INSERT INTO templates (
+      name,
+      purpose,
+      subject_template,
+      body_template,
+      version,
+      is_active
+    )
+    VALUES (
+      @name,
+      @purpose,
+      @subjectTemplate,
+      @bodyTemplate,
+      @version,
+      1
+    )
+  `).run({
+    ...template,
+    version,
+  });
+  return db.prepare(`
+    SELECT
+      id,
+      name,
+      purpose,
+      subject_template AS subjectTemplate,
+      body_template AS bodyTemplate,
+      version,
+      is_active AS isActive,
+      created_at AS createdAt,
+      updated_at AS updatedAt
+    FROM templates
+    WHERE id = ?
+  `).get(result.lastInsertRowid);
+}
+
 function listReadyFollowupReports() {
   if (!fs.existsSync(readyFollowupRunsDir)) return [];
   return fs.readdirSync(readyFollowupRunsDir)
@@ -289,6 +381,10 @@ function parseIdList(value) {
   return [...new Set(items
     .map(item => Number.parseInt(item, 10))
     .filter(Number.isFinite))];
+}
+
+function parseBatchNumberList(value) {
+  return parseIdList(value);
 }
 
 function creatorActivationClauses(query = {}) {
@@ -641,6 +737,7 @@ function sendWorkOrdersPayload(pageNumber = 1) {
     totalItems,
     totalPages,
     summary: sendMailSummaryFromSqlite(),
+    templates: listTemplates(),
     workOrders,
   };
 }
@@ -992,14 +1089,16 @@ function renderInboxClassification() {
 }
 
 function renderSendPage(pageNumber) {
+  const templateOptions = listTemplates()
+    .map(template => `<option value="${escapeHtml(template.name)}"></option>`)
+    .join('');
   const dashboardBundle = path.join(__dirname, 'public', 'app', 'assets', 'main.js');
   if (fs.existsSync(dashboardBundle)) {
     return `
       <section>
         <h2>上传并拆分 xlsx</h2>
         <datalist id="template-options">
-          <option value="0414新规模板"></option>
-          <option value="0421三图模板"></option>
+          ${templateOptions}
         </datalist>
         <form method="post" action="/upload" enctype="multipart/form-data">
           <div class="grid">
@@ -1020,17 +1119,16 @@ function renderSendPage(pageNumber) {
           <button type="submit">上传拆分</button>
         </form>
       </section>
-      <link rel="stylesheet" href="/app/assets/main.css" />
+      <link rel="stylesheet" href="/app/assets/main.css?v=${appAssetVersion}" />
       <div id="send-root" data-page="${escapeHtml(pageNumber || 1)}"></div>
-      <script type="module" src="/app/assets/main.js"></script>
+      <script type="module" src="/app/assets/main.js?v=${appAssetVersion}"></script>
     `;
   }
   return `
-    <section>
-      <h2>上传并拆分 xlsx</h2>
-      <datalist id="template-options">
-        <option value="0414新规模板"></option>
-        <option value="0421三图模板"></option>
+      <section>
+        <h2>上传并拆分 xlsx</h2>
+        <datalist id="template-options">
+        ${templateOptions}
       </datalist>
       <form method="post" action="/upload" enctype="multipart/form-data">
         <div class="grid">
@@ -1064,9 +1162,9 @@ function renderDashboard() {
       <pre>${escapeHtml(JSON.stringify(dashboardPayload(), null, 2))}</pre>
     </section>`;
   }
-  return `<link rel="stylesheet" href="/app/assets/main.css" />
+  return `<link rel="stylesheet" href="/app/assets/main.css?v=${appAssetVersion}" />
     <div id="dashboard-root"></div>
-    <script type="module" src="/app/assets/main.js"></script>`;
+    <script type="module" src="/app/assets/main.js?v=${appAssetVersion}"></script>`;
 }
 
 function dashboardPayload() {
@@ -1439,6 +1537,25 @@ app.get('/api/send-work-orders', (req, res) => {
   res.json(sendWorkOrdersPayload(pageNumber));
 });
 
+app.get('/api/templates', (_req, res) => {
+  res.json({ templates: listTemplates() });
+});
+
+app.post('/api/templates', (req, res, next) => {
+  try {
+    const template = createTemplate(webDb, req.body);
+    res.status(201).json({
+      template: {
+        ...template,
+        isActive: Boolean(template.isActive),
+      },
+      templates: listTemplates(),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get('/send', (req, res) => {
   const pageNumber = Number.parseInt(req.query.page || '1', 10);
   res.send(page('发信 - ProBoost Creator CRM', renderSendPage(pageNumber), 'send'));
@@ -1678,6 +1795,28 @@ app.post('/batch/send', async (req, res, next) => {
       batchNumber: req.body.batchNumber,
       templateName: options.templateName,
       task: job => runBatch(req.body.manifestPath, req.body.batchNumber, {
+        ...options,
+        taskRunId: job.id,
+        claimedBy: `web:${job.id}`,
+      }),
+    });
+    res.redirect(303, '/send');
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/batch/send-selected', async (req, res, next) => {
+  try {
+    const batchNumbers = parseBatchNumberList(req.body.batchNumbers);
+    if (batchNumbers.length === 0) throw new Error('至少选择一个失败批次。');
+    const options = runOptionsFromBody(req.body, false);
+    startJob({
+      type: 'send-selected',
+      manifestPath: req.body.manifestPath,
+      batchNumber: batchNumbers.join(','),
+      templateName: options.templateName,
+      task: job => runSelected(req.body.manifestPath, batchNumbers, {
         ...options,
         taskRunId: job.id,
         claimedBy: `web:${job.id}`,

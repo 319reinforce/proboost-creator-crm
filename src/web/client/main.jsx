@@ -9,8 +9,11 @@ import {
   ChevronRight,
   Database,
   FileText,
+  ListPlus,
   Mail,
+  Plus,
   RefreshCw,
+  Save,
   Send,
   ShieldCheck,
 } from 'lucide-react';
@@ -81,6 +84,20 @@ async function fetchJson(url) {
   const response = await fetch(url, { headers: { Accept: 'application/json' } });
   if (!response.ok) throw new Error(`Request failed: ${response.status}`);
   return response.json();
+}
+
+async function postJson(url, payload) {
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      Accept: 'application/json',
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(data.error || data.message || `Request failed: ${response.status}`);
+  return data;
 }
 
 function StatCard({ icon: Icon, label, value, tone = 'blue', caption }) {
@@ -172,60 +189,210 @@ function DataTable({ rows }) {
 }
 
 function BatchTable({ batches, manifestPath, templateName, disabled }) {
+  const retryableBatches = batches.filter(batch => batch.status === 'failed' && batch.reason !== 'success-toast-not-found');
+  const retryableNumbers = retryableBatches.map(batch => String(batch.batchNumber));
+  const [selected, setSelected] = useState([]);
+
+  useEffect(() => {
+    setSelected(current => current.filter(batchNumber => retryableNumbers.includes(batchNumber)));
+  }, [batches, retryableNumbers.join('|')]);
+
+  const allSelected = retryableNumbers.length > 0 && selected.length === retryableNumbers.length;
+
+  function toggleBatch(batchNumber, checked) {
+    const value = String(batchNumber);
+    setSelected(current => {
+      if (checked) return current.includes(value) ? current : [...current, value];
+      return current.filter(item => item !== value);
+    });
+  }
+
+  function toggleAll(checked) {
+    setSelected(checked ? retryableNumbers : []);
+  }
+
   if (!batches.length) return <p className="empty-text">这个工单还没有批次记录。</p>;
   return (
-    <div className="table-shell">
-      <table className="modern-table batch-table">
-        <thead>
-          <tr>
-            <th>批次</th>
-            <th>文件</th>
-            <th>行数</th>
-            <th>已选</th>
-            <th>状态</th>
-            <th>原因</th>
-            <th>心跳</th>
-            <th>操作</th>
-          </tr>
-        </thead>
-        <tbody>
-          {batches.map(batch => {
-            const canRetry = batch.status === 'failed' && batch.reason !== 'success-toast-not-found';
-            return (
-              <tr key={batch.id || batch.batchNumber}>
-                <td>{batch.batchNumber}</td>
-                <td>{batch.fileName || '-'}</td>
-                <td>{formatNumber(batch.rowCount)}</td>
-                <td>{batch.selectedCount == null ? '-' : formatNumber(batch.selectedCount)}</td>
-                <td><StatusPill status={batch.status}>{batch.label || statusLabel(batch.status)}</StatusPill></td>
-                <td>{batch.reason || '-'}</td>
-                <td>{batch.lastHeartbeatAt || '-'}</td>
-                <td>
-                  {canRetry ? (
-                    <form className="batch-action-form" method="post" action="/batch/send">
-                      <input type="hidden" name="manifestPath" value={manifestPath || ''} />
-                      <input type="hidden" name="batchNumber" value={batch.batchNumber} />
-                      <input type="hidden" name="templateName" value={templateName || '0414新规模板'} />
-                      <button className="icon-action danger-action" type="submit" disabled={!manifestPath || disabled}>
+    <form className="batch-retry-form" method="post" action="/batch/send-selected">
+      <input type="hidden" name="manifestPath" value={manifestPath || ''} />
+      <input type="hidden" name="templateName" value={templateName || '5月新规'} />
+      <div className="batch-bulk-toolbar">
+        <label className="checkbox-line">
+          <input
+            type="checkbox"
+            checked={allSelected}
+            disabled={!retryableNumbers.length || disabled}
+            onChange={event => toggleAll(event.target.checked)}
+          />
+          全选失败批次
+        </label>
+        <span>{formatNumber(selected.length)} / {formatNumber(retryableNumbers.length)} 可补发</span>
+        <button className="icon-action danger-action" type="submit" disabled={!manifestPath || disabled || selected.length === 0}>
+          <Send size={14} />
+          补发选中失败
+        </button>
+      </div>
+      <div className="table-shell">
+        <table className="modern-table batch-table">
+          <thead>
+            <tr>
+              <th>选择</th>
+              <th>批次</th>
+              <th>文件</th>
+              <th>行数</th>
+              <th>已选</th>
+              <th>状态</th>
+              <th>原因</th>
+              <th>心跳</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody>
+            {batches.map(batch => {
+              const canRetry = batch.status === 'failed' && batch.reason !== 'success-toast-not-found';
+              const batchValue = String(batch.batchNumber);
+              const checked = selected.includes(batchValue);
+              return (
+                <tr key={batch.id || batch.batchNumber}>
+                  <td>
+                    {canRetry ? (
+                      <input
+                        type="checkbox"
+                        name="batchNumbers"
+                        value={batch.batchNumber}
+                        checked={checked}
+                        disabled={disabled}
+                        onChange={event => toggleBatch(batch.batchNumber, event.target.checked)}
+                        aria-label={`选择批次 ${batch.batchNumber}`}
+                      />
+                    ) : '-'}
+                  </td>
+                  <td>{batch.batchNumber}</td>
+                  <td>{batch.fileName || '-'}</td>
+                  <td>{formatNumber(batch.rowCount)}</td>
+                  <td>{batch.selectedCount == null ? '-' : formatNumber(batch.selectedCount)}</td>
+                  <td><StatusPill status={batch.status}>{batch.label || statusLabel(batch.status)}</StatusPill></td>
+                  <td>{batch.reason || '-'}</td>
+                  <td>{batch.lastHeartbeatAt || '-'}</td>
+                  <td>
+                    {canRetry ? (
+                      <button
+                        className="icon-action danger-action"
+                        type="submit"
+                        formAction="/batch/send"
+                        name="batchNumber"
+                        value={batch.batchNumber}
+                        disabled={!manifestPath || disabled}
+                      >
                         <Send size={14} />
                         发送
                       </button>
-                    </form>
-                  ) : '-'}
-                </td>
-              </tr>
-            );
-          })}
-        </tbody>
-      </table>
-    </div>
+                    ) : '-'}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </form>
   );
 }
 
-function WorkOrderCard({ order }) {
+function TemplateManager({ templates, onCreated }) {
+  const [open, setOpen] = useState(false);
+  const [name, setName] = useState('5月新规');
+  const [purpose, setPurpose] = useState('send_mail');
+  const [subjectTemplate, setSubjectTemplate] = useState('5月新规');
+  const [bodyTemplate, setBodyTemplate] = useState('5月新规');
+  const [saving, setSaving] = useState(false);
+  const [message, setMessage] = useState('');
+
+  async function submit(event) {
+    event.preventDefault();
+    setSaving(true);
+    setMessage('');
+    try {
+      const data = await postJson('/api/templates', {
+        name,
+        purpose,
+        subjectTemplate,
+        bodyTemplate,
+      });
+      setMessage(`已添加：${data.template?.name || name}`);
+      onCreated?.(data.templates || []);
+      setName('');
+      setSubjectTemplate('');
+      setBodyTemplate('');
+    } catch (err) {
+      setMessage(err.message || String(err));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <section className="dashboard-band template-manager">
+      <div className="template-manager-head">
+        <div className="section-title">
+          <ListPlus size={18} />
+          <span>模板管理</span>
+          <em>{formatNumber(templates.length)} 个可用模板</em>
+        </div>
+        <button className="refresh-button secondary-button" type="button" onClick={() => setOpen(value => !value)}>
+          <Plus size={16} />
+          新增模板
+        </button>
+      </div>
+
+      <div className="template-chip-row">
+        {templates.map(template => (
+          <span className="template-chip" key={`${template.name}-${template.version}`}>
+            {template.name}
+            <em>v{template.version}</em>
+          </span>
+        ))}
+      </div>
+
+      {open ? (
+        <form className="template-form" onSubmit={submit}>
+          <label>
+            <span>模板名</span>
+            <input value={name} onChange={event => setName(event.target.value)} required />
+          </label>
+          <label>
+            <span>用途</span>
+            <input value={purpose} onChange={event => setPurpose(event.target.value)} />
+          </label>
+          <label>
+            <span>标题模板</span>
+            <input value={subjectTemplate} onChange={event => setSubjectTemplate(event.target.value)} placeholder="默认同模板名" />
+          </label>
+          <label className="template-body-field">
+            <span>正文模板</span>
+            <textarea value={bodyTemplate} onChange={event => setBodyTemplate(event.target.value)} placeholder="默认同模板名" />
+          </label>
+          <div className="template-form-actions">
+            <button className="refresh-button" type="submit" disabled={saving}>
+              <Save size={16} />
+              保存模板
+            </button>
+            {message ? <span className={message.startsWith('已添加') ? 'form-message success' : 'form-message error'}>{message}</span> : null}
+          </div>
+        </form>
+      ) : null}
+    </section>
+  );
+}
+
+function WorkOrderCard({ order, templates }) {
   const summary = order.summary || {};
   const hasActiveJob = (order.activeJobs || []).length > 0;
-  const [templateName, setTemplateName] = useState('0414新规模板');
+  const [templateName, setTemplateName] = useState(templates[0]?.name || '5月新规');
+
+  useEffect(() => {
+    if (!templateName && templates[0]?.name) setTemplateName(templates[0].name);
+  }, [templateName, templates]);
 
   return (
     <section className="dashboard-band work-order-card">
@@ -320,11 +487,21 @@ function SendApp({ initialPage = 1 }) {
 
   const summary = payload?.summary || {};
   const workOrders = payload?.workOrders || [];
+  const templates = payload?.templates || [];
   const canPrev = Number(payload?.page || page) > 1;
   const canNext = Number(payload?.page || page) < Number(payload?.totalPages || 1);
 
+  function updateTemplates(nextTemplates) {
+    setPayload(current => current ? { ...current, templates: nextTemplates } : current);
+  }
+
   return (
     <div className="crm-app send-app">
+      <datalist id="template-options">
+        {templates.map(template => (
+          <option key={`${template.name}-${template.version}`} value={template.name} />
+        ))}
+      </datalist>
       <div className="dashboard-head">
         <div>
           <p className="eyebrow">Send Mail Operations</p>
@@ -353,13 +530,15 @@ function SendApp({ initialPage = 1 }) {
         </div>
       </section>
 
+      <TemplateManager templates={templates} onCreated={updateTemplates} />
+
       {loading && !payload ? <p className="empty-text">正在加载发信工单...</p> : null}
       {!loading && !workOrders.length ? (
         <section className="dashboard-band empty-panel">
           <p className="empty-text">还没有 SQLite 发信工单。上传并拆分 xlsx 后，这里会显示批次状态。</p>
         </section>
       ) : null}
-      {workOrders.map(order => <WorkOrderCard key={order.id} order={order} />)}
+      {workOrders.map(order => <WorkOrderCard key={order.id} order={order} templates={templates} />)}
 
       {payload && payload.totalItems > payload.pageSize ? (
         <nav className="send-pagination" aria-label="工单分页">

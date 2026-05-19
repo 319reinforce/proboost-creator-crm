@@ -296,6 +296,103 @@ async function runPending(manifestPath, options = {}) {
   }));
 }
 
+async function runSelected(manifestPath, batchNumbers, options = {}) {
+  const manifest = readManifest(manifestPath);
+  if (!manifest) throw new Error(`manifest not found: ${manifestPath}`);
+  tryUpsertManifestState(manifestPath, manifest, null);
+
+  const selectedNumbers = [...new Set((Array.isArray(batchNumbers) ? batchNumbers : String(batchNumbers || '').split(','))
+    .map(value => Number.parseInt(value, 10))
+    .filter(Number.isFinite))]
+    .sort((a, b) => a - b);
+  if (selectedNumbers.length === 0) throw new Error('No batch numbers were selected.');
+
+  const taskRunId = options.taskRunId || fallbackTaskRunId('send-mail-selected');
+  const claimedBy = options.claimedBy || `pid:${process.pid}`;
+  const claim = withDb(db => {
+    const claimed = [];
+    const skipped = [];
+    const transaction = db.transaction(() => {
+      for (const batchNumber of selectedNumbers) {
+        const result = claimSendMailBatch(db, {
+          manifestPath,
+          batchNumber,
+          taskRunId,
+          claimedBy,
+          prepareOnly: options.prepareOnly,
+        });
+        if (result.claimed) claimed.push(result.batch);
+        else skipped.push({ batchNumber, reason: result.reason });
+      }
+    });
+    transaction();
+    return { claimed, skipped };
+  });
+
+  const claimedNumbers = claim.claimed.map(batch => Number(batch.batchNumber));
+  if (claimedNumbers.length === 0) {
+    const reasons = claim.skipped.map(item => `${item.batchNumber}:${item.reason}`).join(', ');
+    throw new Error(`selected batches were not claimed: ${reasons || 'none-claimable'}`);
+  }
+
+  const selected = manifest.batches
+    .filter(batch => claimedNumbers.includes(Number(batch.batchNumber)))
+    .sort((a, b) => a.batchNumber - b.batchNumber);
+  if (selected.length === 0) throw new Error(`selected batches were not found in manifest: ${claimedNumbers.join(',')}`);
+
+  const runName = `${path.basename(path.dirname(manifestPath))}-selected-${timestamp()}`;
+  const logFile = path.join(runsDir, `${runName}.log`);
+  const batchList = selected.map(batch => batch.batchNumber).join(',');
+
+  for (const batch of selected) {
+    updateBatchStatus(manifest, batch.batchNumber, options.prepareOnly ? 'preparing' : 'sending', {
+      startedAt: new Date().toISOString(),
+    });
+  }
+  writeJson(manifestPath, manifest);
+
+  const env = {
+    XLSX_FILE: selected[0].file,
+    TEMPLATE_NAME: options.templateName || '0414新规模板',
+    BATCH_LIST: batchList,
+    MANIFEST_PATH: manifestPath,
+    KEEP_BROWSER_OPEN: options.keepOpen ? '1' : '0',
+    CLOSE_AFTER_SEND: options.closeAfterSend ? '1' : '0',
+    VERIFY_SEND_RECORD: options.verifySendRecord ? '1' : '0',
+    WAIT_AFTER_IMPORT: String(options.waitAfterImport || 12000),
+    PAGE_SIZE: String(options.pageSize || 500),
+  };
+
+  const runnableAutoScript = prepareRuntimeAutoScript(ownedAutoScript);
+  const heartbeat = () => withDb(db => heartbeatSendMailBatches(db, {
+    taskRunId,
+    batchNumbers: claimedNumbers,
+  }));
+  try {
+    await runNode(runnableAutoScript, env, logFile, { onHeartbeat: heartbeat });
+  } catch (error) {
+    const latestAfterFailure = markManifestBatchesFailed(manifestPath, claimedNumbers, 'runner-exited-nonzero');
+    if (latestAfterFailure) tryUpsertManifestState(manifestPath, latestAfterFailure, logFile);
+    withDb(db => failClaimedSendMailBatches(db, {
+      taskRunId,
+      batchNumbers: claimedNumbers,
+      reason: 'runner-exited-nonzero',
+    }));
+    throw error;
+  }
+  const crmSync = trySyncManifest(manifestPath, logFile);
+  const latest = readManifest(manifestPath);
+  const dbSync = latest ? tryUpsertManifestState(manifestPath, latest, logFile) : null;
+  return selected.map(batch => ({
+    manifestPath,
+    batchNumber: batch.batchNumber,
+    logFile,
+    manifest: latest,
+    crmSync,
+    dbSync,
+  }));
+}
+
 module.exports = {
   uploadsDir,
   batchesDir,
@@ -303,4 +400,5 @@ module.exports = {
   splitUploadedFile,
   runBatch,
   runPending,
+  runSelected,
 };

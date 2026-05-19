@@ -122,6 +122,12 @@
   background: linear-gradient(180deg, color-mix(in oklch, var(--crm-red) 84%, white), var(--crm-red));
 }
 
+.secondary-button {
+  border-color: var(--crm-line);
+  color: var(--crm-ink);
+  background: color-mix(in oklch, var(--crm-panel) 92%, transparent);
+}
+
 .send-app {
   margin-top: 18px;
 }
@@ -260,9 +266,9 @@
   margin-top: 10px;
 }
 
-.batch-table td:nth-child(2),
-.batch-table td:nth-child(6),
-.batch-table td:nth-child(7) {
+.batch-table td:nth-child(3),
+.batch-table td:nth-child(7),
+.batch-table td:nth-child(8) {
   max-width: 240px;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -271,6 +277,38 @@
 
 .batch-action-form {
   margin: 0;
+}
+
+.batch-retry-form {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+}
+
+.batch-bulk-toolbar {
+  display: flex;
+  min-height: 38px;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  color: var(--crm-muted);
+  font-size: 12px;
+  font-weight: 760;
+}
+
+.batch-bulk-toolbar .checkbox-line {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  margin-right: auto;
+  color: var(--crm-ink);
+}
+
+.batch-bulk-toolbar input,
+.batch-table input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--crm-red);
 }
 
 .empty-panel {
@@ -321,6 +359,106 @@
 
 .summary-band {
   padding: 16px;
+}
+
+.template-manager {
+  display: grid;
+  gap: 14px;
+  padding: 16px;
+}
+
+.template-manager-head {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.template-manager .section-title {
+  margin-bottom: 0;
+}
+
+.template-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.template-chip {
+  display: inline-flex;
+  min-height: 30px;
+  align-items: center;
+  gap: 7px;
+  border: 1px solid color-mix(in oklch, var(--crm-blue) 30%, var(--crm-line));
+  border-radius: 999px;
+  padding: 0 10px;
+  color: var(--crm-ink);
+  background: color-mix(in oklch, var(--crm-blue) 8%, var(--crm-panel));
+  font-size: 12px;
+  font-weight: 780;
+}
+
+.template-chip em {
+  color: var(--crm-muted);
+  font-size: 11px;
+  font-style: normal;
+}
+
+.template-form {
+  display: grid;
+  grid-template-columns: minmax(150px, 1fr) minmax(130px, 0.7fr) minmax(180px, 1.2fr);
+  gap: 10px;
+}
+
+.template-form label {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+  color: var(--crm-muted);
+  font-size: 12px;
+  font-weight: 780;
+}
+
+.template-form input,
+.template-form textarea {
+  width: 100%;
+  min-height: 38px;
+  border: 1px solid var(--crm-line);
+  border-radius: 8px;
+  padding: 0 10px;
+  color: var(--crm-ink);
+  background: color-mix(in oklch, var(--crm-panel) 94%, transparent);
+  font: inherit;
+}
+
+.template-form textarea {
+  min-height: 96px;
+  padding: 9px 10px;
+  resize: vertical;
+}
+
+.template-body-field,
+.template-form-actions {
+  grid-column: 1 / -1;
+}
+
+.template-form-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.form-message {
+  font-size: 13px;
+  font-weight: 760;
+}
+
+.form-message.success {
+  color: var(--crm-green);
+}
+
+.form-message.error {
+  color: var(--crm-red);
 }
 
 .chart-panel {
@@ -659,6 +797,7 @@
 
   .dashboard-grid,
   .progress-visual,
+  .template-form,
   .work-order-head,
   .work-order-metrics {
     grid-template-columns: 1fr;
@@ -668,6 +807,8 @@
 @media (max-width: 640px) {
   .dashboard-head,
   .followup-panel,
+  .template-manager-head,
+  .template-form-actions,
   .send-pagination {
     align-items: stretch;
     flex-direction: column;
